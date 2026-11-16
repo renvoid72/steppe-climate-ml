@@ -1,0 +1,17 @@
+# Локальные данные и ГИС-слои
+/meteo_ru/
+/cru ceda/
+/maps_*/
+
+# Результаты расчётов
+/output*/
+
+# Окружение и кэш Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Локальная копия визуализатора
+/code/kursach011_modules/visualizer — копия.py

@@ -1,0 +1,588 @@
+# -*- coding: utf-8 -*-
+"""
+Аналитический модуль постобработки данных курсовой работы.
+Задачи:
+1. Создание структуры директорий.
+2. Чтение данных долгосрочной валидации за 1990-2020 гг.
+3. Группировка по макрорегионам России и сохранение 4 Excel-файлов (с двумя таблицами бок о бок на 5 вкладках).
+4. Расчет статистических метрик точности моделей (R2, MAE, RMSE) по всей зоне степей.
+5. Генерация атласа из 208 карт за 2020 год с динамической шкалой и кубической интерполяцией.
+"""
+
+import sys
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import warnings
+from scipy.interpolate import griddata
+import xarray as xr
+from shapely.geometry import mapping
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+warnings.filterwarnings('ignore')
+
+# --- КОНСТАНТЫ ПУТЕЙ ---
+PROJECT_DIR = Path(r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files")
+RESULTS_DIR = PROJECT_DIR / "output011_modules"
+ANALYTICS_DIR = RESULTS_DIR / "analytics_reports"
+
+# Добавляем путь к коду в sys.path, чтобы импортировать BaseVisualizer
+sys.path.append(str(PROJECT_DIR / "code"))
+try:
+    from kursach011_modules.visualizer import BaseVisualizer
+    HAS_VISUALIZER = True
+except ImportError as e:
+    HAS_VISUALIZER = False
+    print(f"ВНИМАНИЕ: Не удалось импортировать BaseVisualizer: {e}")
+
+# --- СЛОВАРИ ПЕРЕВОДА ДЛЯ КАРТ ---
+RU_MONTHS = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель", 5: "Май", 6: "Июнь",
+    7: "Июль", 8: "Август", 9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+}
+
+RU_DATASETS = {
+    'METEO_RU': "Метео_РФ",
+    'CRU_CEDA': "CRU_CEDA"
+}
+
+RU_VARS = {
+    'DTR': "DTR",
+    'Precip': "Осадки"
+}
+
+RU_MODELS_FILE = {
+    'Fact': "Факт",
+    'Random Forest': "Случайный_Лес",
+    'K-Neighbors': "Ближайшие_Соседи",
+    'MLP Neural Network': "Нейросеть"
+}
+
+RU_MODELS_TITLE = {
+    'Fact': "Фактические данные",
+    'Random Forest': "Модель Random Forest (RF)",
+    'K-Neighbors': "Модель K-Neighbors (KNN)",
+    'MLP Neural Network': "Модель MLP Neural Network"
+}
+
+
+def create_directories():
+    """Создает структуру папок для отчетов и карт."""
+    print("1. Создание структуры папок...")
+    folders = [
+        ANALYTICS_DIR,
+        ANALYTICS_DIR / "maps_png" / "meteo_ru" / "DTR",
+        ANALYTICS_DIR / "maps_png" / "meteo_ru" / "Precip",
+        ANALYTICS_DIR / "maps_png" / "cru_ceda" / "DTR",
+        ANALYTICS_DIR / "maps_png" / "cru_ceda" / "Precip",
+        ANALYTICS_DIR / "maps_tiff" / "meteo_ru" / "DTR",
+        ANALYTICS_DIR / "maps_tiff" / "meteo_ru" / "Precip",
+        ANALYTICS_DIR / "maps_tiff" / "cru_ceda" / "DTR",
+        ANALYTICS_DIR / "maps_tiff" / "cru_ceda" / "Precip",
+    ]
+    for folder in folders:
+        folder.mkdir(parents=True, exist_ok=True)
+    print("   -> Папки успешно созданы.")
+
+
+def get_macroregion(lon):
+    """Определяет макрорегион России на основе долготы."""
+    if lon < 60:
+        return 'Европейская часть'
+    elif 60 <= lon < 90:
+        return 'Западная Сибирь'
+    elif 90 <= lon < 120:
+        return 'Восточная Сибирь'
+    else:
+        return 'Дальний Восток'
+
+
+def load_and_pivot_data(csv_path):
+    """Загружает CSV долгосрочной валидации и разворачивает модели по столбцам."""
+    df = pd.read_csv(csv_path)
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['Year'] = df['Date'].dt.year
+    df['Month'] = df['Date'].dt.month
+
+    # Сводим таблицу
+    pivoted = df.pivot_table(
+        index=['Date', 'Year', 'Month', 'WMO', 'Latitude', 'Longitude', 'Fact'],
+        columns='Model',
+        values='Forecast'
+    ).reset_index()
+
+    # Проверка на наличие всех трех моделей
+    for model in ['Random Forest', 'K-Neighbors', 'MLP Neural Network']:
+        if model not in pivoted.columns:
+            pivoted[model] = np.nan
+
+    # Добавляем макрорегион
+    pivoted['Region'] = pivoted['Longitude'].apply(get_macroregion)
+    return pivoted
+
+
+def generate_excel_reports(dataset_info):
+    """Генерирует Excel-отчеты с 5 листами и 2 таблицами бок о бок."""
+    print("3. Генерация Excel-отчетов (1990-2020 гг.)...")
+    
+    regions_config = [
+        ('Вся зона степей', None),
+        ('Европейская часть', 'Европейская часть'),
+        ('Западная Сибирь', 'Западная Сибирь'),
+        ('Восточная Сибирь', 'Восточная Сибирь'),
+        ('Дальний Восток', 'Дальний Восток')
+    ]
+
+    for key, info in dataset_info.items():
+        pivoted_df = info['pivoted']
+        var = info['var']
+        dataset = info['dataset']
+        
+        file_name = f"{'Meteo_RU' if dataset == 'METEO_RU' else 'CRU_CEDA'}_{var}_1990-2020.xlsx"
+        output_path = ANALYTICS_DIR / file_name
+        
+        print(f"   Формирование отчета: {file_name}...")
+        
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            for sheet_name, region_name in regions_config:
+                if region_name is None:
+                    region_df = pivoted_df
+                else:
+                    region_df = pivoted_df[pivoted_df['Region'] == region_name]
+                
+                # Если в регионе нет станций
+                if region_df.empty:
+                    # Создаем пустые таблицы
+                    empty_monthly = pd.DataFrame(columns=['Year', 'Month', 'Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network'])
+                    empty_annual = pd.DataFrame(columns=['Year', 'Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network'])
+                    empty_monthly.to_excel(writer, sheet_name=sheet_name, startcol=0, index=False)
+                    empty_annual.to_excel(writer, sheet_name=sheet_name, startcol=7, index=False)
+                    continue
+
+                # Левая таблица: Месячные значения (среднее по станциям региона)
+                monthly_avg = region_df.groupby(['Year', 'Month']).agg({
+                    'Fact': 'mean',
+                    'Random Forest': 'mean',
+                    'K-Neighbors': 'mean',
+                    'MLP Neural Network': 'mean'
+                }).reset_index()
+                
+                monthly_avg = monthly_avg.sort_values(['Year', 'Month']).reset_index(drop=True)
+                cols_monthly = ['Year', 'Month', 'Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network']
+                monthly_table = monthly_avg[cols_monthly]
+
+                # Правая таблица: Годовые значения
+                agg_func = 'mean' if var == 'DTR' else 'sum'
+                annual_avg = monthly_avg.groupby('Year').agg({
+                    'Fact': agg_func,
+                    'Random Forest': agg_func,
+                    'K-Neighbors': agg_func,
+                    'MLP Neural Network': agg_func
+                }).reset_index()
+                
+                annual_avg = annual_avg.sort_values('Year').reset_index(drop=True)
+                cols_annual = ['Year', 'Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network']
+                annual_table = annual_avg[cols_annual]
+
+                # Записываем обе таблицы бок о бок (пропуская столбец G - index 6)
+                monthly_table.to_excel(writer, sheet_name=sheet_name, startcol=0, index=False)
+                annual_table.to_excel(writer, sheet_name=sheet_name, startcol=7, index=False)
+
+    print("   -> Отчеты Excel успешно сохранены.")
+
+
+def load_full_fact_data():
+    """Загружает полнопериодные фактические данные для Метео РФ (1960-2024) и CRU CEDA (1901-2020)."""
+    print("3.1. Загрузка полнопериодных фактических данных...")
+    fact_datasets = {}
+
+    # 1. Метеостанции РФ
+    meteo_txt = PROJECT_DIR / "метео ру" / "all_steppe_data.txt"
+    coords_txt = PROJECT_DIR / "метео ру" / "stations_coords.txt"
+    if meteo_txt.exists() and coords_txt.exists():
+        print("   Загрузка фактических данных Метео РФ (1960-2024 гг.)...")
+        cols = ['WMO', 'Year', 'Month', 'Day', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']
+        df_meteo = pd.read_csv(meteo_txt, sep=r'\s+', names=cols, na_values=[-999.9])
+        df_meteo['DTR'] = df_meteo['Tmax'] - df_meteo['Tmin']
+
+        coords = pd.read_csv(coords_txt, sep=r'\s+')
+        lat_map = dict(zip(coords['WMO'], coords['Lat']))
+        lon_map = dict(zip(coords['WMO'], coords['Lon']))
+        df_meteo['Latitude'] = df_meteo['WMO'].map(lat_map)
+        df_meteo['Longitude'] = df_meteo['WMO'].map(lon_map)
+
+        # Помесячная агрегация по станциям
+        df_meteo_monthly = df_meteo.groupby(['WMO', 'Year', 'Month', 'Latitude', 'Longitude']).agg({
+            'DTR': 'mean',
+            'Precip': 'sum'
+        }).reset_index()
+        df_meteo_monthly['Region'] = df_meteo_monthly['Longitude'].apply(get_macroregion)
+        fact_datasets['METEO_RU'] = df_meteo_monthly
+    else:
+        print("   ! ВНИМАНИЕ: Файлы данных Метео РФ не найдены.")
+
+    # 2. CRU CEDA
+    cru_csv = PROJECT_DIR / "cru ceda" / "cru_aligned_data.csv"
+    if cru_csv.exists():
+        print("   Загрузка фактических данных CRU CEDA (1901-2020 гг.)...")
+        df_cru = pd.read_csv(cru_csv)
+        df_cru['Region'] = df_cru['Longitude'].apply(get_macroregion)
+        fact_datasets['CRU_CEDA'] = df_cru
+    else:
+        print("   ! ВНИМАНИЕ: Файл данных CRU CEDA не найден.")
+
+    return fact_datasets
+
+
+def generate_fact_only_excel_reports(fact_datasets):
+    """Генерирует 4 Excel-отчета только с фактическими данными за полный исторический период."""
+    print("3.2. Генерация Excel-отчетов с фактическими данными за весь период...")
+
+    regions_config = [
+        ('Вся зона степей', None),
+        ('Европейская часть', 'Европейская часть'),
+        ('Западная Сибирь', 'Западная Сибирь'),
+        ('Восточная Сибирь', 'Восточная Сибирь'),
+        ('Дальний Восток', 'Дальний Восток')
+    ]
+
+    for dataset_key, df_fact in fact_datasets.items():
+        prefix = 'Meteo_RU' if dataset_key == 'METEO_RU' else 'CRU_CEDA'
+        min_year = int(df_fact['Year'].min())
+        max_year = int(df_fact['Year'].max())
+
+        for var in ['DTR', 'Precip']:
+            file_name = f"{prefix}_{var}_Fact_{min_year}-{max_year}.xlsx"
+            output_path = ANALYTICS_DIR / file_name
+            print(f"   Формирование отчета с фактом: {file_name}...")
+
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                for sheet_name, region_name in regions_config:
+                    if region_name is None:
+                        region_df = df_fact
+                    else:
+                        region_df = df_fact[df_fact['Region'] == region_name]
+
+                    if region_df.empty:
+                        empty_monthly = pd.DataFrame(columns=['Year', 'Month', 'Fact'])
+                        empty_annual = pd.DataFrame(columns=['Year', 'Fact'])
+                        empty_monthly.to_excel(writer, sheet_name=sheet_name, startcol=0, index=False)
+                        empty_annual.to_excel(writer, sheet_name=sheet_name, startcol=7, index=False)
+                        continue
+
+                    # Левая таблица: Месячные значения факта (среднее по станциям региона)
+                    monthly_avg = region_df.groupby(['Year', 'Month'])[var].mean().reset_index()
+                    monthly_avg = monthly_avg.rename(columns={var: 'Fact'})
+                    monthly_avg = monthly_avg.sort_values(['Year', 'Month']).reset_index(drop=True)
+                    monthly_table = monthly_avg[['Year', 'Month', 'Fact']]
+
+                    # Правая таблица: Годовые значения факта
+                    agg_func = 'mean' if var == 'DTR' else 'sum'
+                    annual_avg = monthly_avg.groupby('Year')['Fact'].agg(agg_func).reset_index()
+                    annual_avg = annual_avg.sort_values('Year').reset_index(drop=True)
+                    annual_table = annual_avg[['Year', 'Fact']]
+
+                    # Записываем обе таблицы бок о бок (пропуская столбец G - index 6)
+                    monthly_table.to_excel(writer, sheet_name=sheet_name, startcol=0, index=False)
+                    annual_table.to_excel(writer, sheet_name=sheet_name, startcol=7, index=False)
+
+    print("   -> Отчеты Excel с фактическими данными за весь период успешно сохранены.")
+
+
+
+def calculate_and_save_metrics(raw_datasets):
+    """Рассчитывает общие метрики точности за 1990-2020 гг. и сохраняет в metrics_summary.txt."""
+    print("4. Расчет общих метрик точности моделей (1990-2020 гг.)...")
+    output_path = ANALYTICS_DIR / "metrics_summary.txt"
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write("========================================================================\n")
+        f.write("СУММАРНЫЕ СТАТИСТИЧЕСКИЕ МЕТРИКИ ТОЧНОСТИ МОДЕЛЕЙ (1990-2020 гг.)\n")
+        f.write("========================================================================\n\n")
+
+        for key, info in raw_datasets.items():
+            df_raw = info['raw']
+            var = info['var']
+            dataset = info['dataset']
+            
+            f.write(f"ДАТАСЕТ: {dataset} | ПОКАЗАТЕЛЬ: {var}\n")
+            f.write("-" * 60 + "\n")
+            
+            models = ['Random Forest', 'K-Neighbors', 'MLP Neural Network']
+            for model in models:
+                model_data = df_raw[df_raw['Model'] == model].dropna(subset=['Forecast', 'Fact'])
+                if not model_data.empty:
+                    y_true = model_data['Fact'].values
+                    y_pred = model_data['Forecast'].values
+                    
+                    r2 = r2_score(y_true, y_pred)
+                    mae = mean_absolute_error(y_true, y_pred)
+                    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+                    
+                    f.write(f"Модель: {model}\n")
+                    f.write(f"  R²:   {r2:8.4f}\n")
+                    f.write(f"  MAE:  {mae:8.4f}\n")
+                    f.write(f"  RMSE: {rmse:8.4f}\n\n")
+                else:
+                    f.write(f"Модель: {model} — Данные отсутствуют.\n\n")
+            f.write("=" * 70 + "\n\n")
+
+    print(f"   -> Метрики точности сохранены в: {output_path.name}")
+
+
+def generate_map_atlas(dataset_info):
+    """Генерирует атлас карт за 2020 год (208 штук)."""
+    print("5. Запуск генерации атласа карт за 2020 год...")
+    
+    if not HAS_VISUALIZER:
+        print("ОШИБКА: Визуализатор не найден. Пропуск карт.")
+        return
+
+    # Загружаем базовую гео-основу через BaseVisualizer (чтобы не читать файлы каждый раз)
+    viz = BaseVisualizer(base_dir=PROJECT_DIR, results_dir=RESULTS_DIR, subfolder_name="analytics_reports")
+    mask = viz.mask
+    world_map = viz.world_map
+
+    total_maps = 0
+
+    for key, info in dataset_info.items():
+        pivoted_df = info['pivoted']
+        var = info['var']
+        dataset = info['dataset']
+        
+        # Папки выхода для конкретного датасета и показателя
+        dataset_folder = "meteo_ru" if dataset == 'METEO_RU' else "cru_ceda"
+        png_dir = ANALYTICS_DIR / "maps_png" / dataset_folder / var
+        tiff_dir = ANALYTICS_DIR / "maps_tiff" / dataset_folder / var
+
+        # Настройки палитры
+        cmap = 'plasma' if var == 'DTR' else 'YlGnBu'
+        var_label = 'Суточная амплитуда температуры, °C' if var == 'DTR' else 'Количество осадков, мм'
+        ru_var_title = RU_VARS[var]
+
+        # Фильтруем за 2020 год
+        df_2020 = pivoted_df[pivoted_df['Year'] == 2020].copy()
+        if df_2020.empty:
+            print(f"   ВНИМАНИЕ: Нет данных за 2020 год для {dataset}_{var}!")
+            continue
+
+        # Определяем границы сетки по координатам всех станций этого датасета
+        lat_min, lat_max = pivoted_df['Latitude'].min() - 0.5, pivoted_df['Latitude'].max() + 0.5
+        lon_min, lon_max = pivoted_df['Longitude'].min() - 0.5, pivoted_df['Longitude'].max() + 0.5
+        grid_lat, grid_lon = np.mgrid[lat_min:lat_max:0.05, lon_min:lon_max:0.05]
+
+        # Генерируем 13 срезов: 12 месяцев + 1 годовой
+        for month_idx in range(1, 14):
+            is_annual = (month_idx == 13)
+            
+            # 1. Готовим данные среза для всех моделей и факта
+            if is_annual:
+                # Годовая агрегация для каждой станции
+                agg_func = 'mean' if var == 'DTR' else 'sum'
+                df_slice = df_2020.groupby(['WMO', 'Latitude', 'Longitude']).agg({
+                    'Fact': agg_func,
+                    'Random Forest': agg_func,
+                    'K-Neighbors': agg_func,
+                    'MLP Neural Network': agg_func
+                }).reset_index()
+                slice_name = "Год"
+                title_time = "Годовой срез 2020 г."
+            else:
+                df_slice = df_2020[df_2020['Month'] == month_idx].copy()
+                slice_name = RU_MONTHS[month_idx]
+                title_time = f"{slice_name} 2020 г."
+
+            if df_slice.empty:
+                continue
+
+            points = df_slice[['Latitude', 'Longitude']].values
+
+            # 2. Строим интерполированные гриды для Fact, RF, KNN, MLP
+            models_to_draw = ['Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network']
+            grids = {}
+            
+            for m in models_to_draw:
+                vals = df_slice[m].values
+                # Кубическая интерполяция
+                grid = griddata(points, vals, (grid_lat, grid_lon), method='cubic')
+                # Ограничиваем снизу нулем только для осадков, так как для DTR допускаются любые значения
+                # (а кубическая интерполяция на осадках может давать отрицательные значения на резких градиентах).
+                if var == 'Precip':
+                    grid = np.clip(grid, 0, None)
+                
+                # Создаем xarray DataArray и обрезаем по маске
+                da = xr.DataArray(
+                    grid,
+                    coords={'latitude': grid_lat[:, 0], 'longitude': grid_lon[0, :]},
+                    dims=('latitude', 'longitude')
+                )
+                da.rio.write_crs("epsg:4326", inplace=True)
+                
+                if mask is not None:
+                    try:
+                        da = da.rio.clip(mask.apply(mapping), da.rio.crs, drop=False)
+                    except:
+                        pass
+                
+                grids[m] = da
+
+            # 3. Рассчитываем общую динамическую шкалу (vmin, vmax) по всем 4 картам среза
+            all_values = [da.values for da in grids.values()]
+            vmin = np.nanmin(all_values)
+            vmax = np.nanmax(all_values)
+            
+            if np.isnan(vmin) or np.isnan(vmax):
+                vmin, vmax = 0, 1
+            else:
+                # Округлим для аккуратности
+                vmin = np.floor(vmin * 10) / 10
+                vmax = np.ceil(vmax * 10) / 10
+                # Для осадков гарантируем vmin >= 0
+                if var == 'Precip':
+                    vmin = max(0.0, vmin)
+
+            # 4. Отрисовка и сохранение каждой из 4 карт
+            for m in models_to_draw:
+                da = grids[m]
+                
+                model_file = RU_MODELS_FILE[m]
+                model_title = RU_MODELS_TITLE[m]
+                
+                # Имена файлов и заголовки полностью на русском
+                ru_dataset_name = RU_DATASETS[dataset]
+                file_name_base = f"{ru_dataset_name}_{ru_var_title}_{model_file}_{slice_name}_2020"
+                
+                png_path = png_dir / f"{file_name_base}.png"
+                tiff_path = tiff_dir / f"{file_name_base}.tif"
+
+                title = f"{ru_var_title} ({model_title})\n{ru_dataset_name} | {title_time}"
+                
+                # Отрисовка
+                fig, ax = plt.subplots(figsize=(18, 6))
+                
+                if world_map is not None:
+                    world_map.plot(ax=ax, color='#e0e0e0', edgecolor='white', linewidth=0.2, zorder=0)
+                
+                da.plot(ax=ax, cmap=cmap, vmin=vmin, vmax=vmax, add_colorbar=False, zorder=1, alpha=1.0)
+                ax.grid(True, linestyle=':', alpha=0.4, color='black', linewidth=0.8, zorder=2)
+                
+                # Добавляем легенду
+                im = ax.collections[-1]
+                cbar = plt.colorbar(im, ax=ax, fraction=0.015, pad=0.02, shrink=0.7)
+                cbar.set_label(var_label, fontsize=10)
+                
+                ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
+                ax.set_xlabel("Долгота", fontsize=10)
+                ax.set_ylabel("Широта", fontsize=10)
+                
+                # Зумируем маску
+                ax.set_xlim(lon_min - 10, lon_max + 15) 
+                ax.set_ylim(lat_min - 8, lat_max + 12)
+                
+                plt.tight_layout()
+                
+                # Сохраняем форматы
+                plt.savefig(png_path, dpi=200)
+                plt.savefig(tiff_path, dpi=300, format='tiff', pil_kwargs={'compression': 'tiff_lzw'})
+                plt.close()
+                
+                total_maps += 1
+                
+            print(f"   [{dataset} {var}] Готово для: {title_time} (4 карты)")
+
+    print(f"\n   -> Атлас сгенерирован! Создано {total_maps} карт в форматах PNG и TIFF.")
+
+
+def cleanup_empty_folders():
+    """Удаляет пустые папки maps и plots, созданные конструктором BaseVisualizer."""
+    print("\n6. Очистка пустых папок...")
+    for folder_name in ["plots", "maps"]:
+        folder_path = ANALYTICS_DIR / folder_name
+        if folder_path.exists() and folder_path.is_dir():
+            if not any(folder_path.iterdir()):
+                try:
+                    folder_path.rmdir()
+                    print(f"   -> Удалена пустая папка: {folder_path.name}")
+                except Exception as e:
+                    print(f"   ! Не удалось удалить папку {folder_path.name}: {e}")
+
+
+def main():
+    print(">>> СТАРТ РАБОТЫ АНАЛИТИЧЕСКОГО МОДУЛЯ <<<\n")
+    
+    # Шаг 1. Папки
+    create_directories()
+    
+    # Шаг 2. Загрузка исходных CSV
+    print("\n2. Загрузка исходных данных долгосрочной валидации...")
+    csv_configs = {
+        'meteo_dtr': {
+            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / 'Validation_METEO_RU_DTR_1990-2020.csv',
+            'dataset': 'METEO_RU',
+            'var': 'DTR'
+        },
+        'meteo_precip': {
+            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / 'Validation_METEO_RU_Precip_1990-2020.csv',
+            'dataset': 'METEO_RU',
+            'var': 'Precip'
+        },
+        'cru_dtr': {
+            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / 'Validation_CRU_CEDA_DTR_1990-2020.csv',
+            'dataset': 'CRU_CEDA',
+            'var': 'DTR'
+        },
+        'cru_precip': {
+            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / 'Validation_CRU_CEDA_Precip_1990-2020.csv',
+            'dataset': 'CRU_CEDA',
+            'var': 'Precip'
+        }
+    }
+    
+    dataset_info = {}
+    for key, config in csv_configs.items():
+        if not config['path'].exists():
+            print(f"ОШИБКА: Файл валидации не найден: {config['path']}")
+            print("Сначала запустите основной расчет kursach011.py!")
+            return
+        
+        print(f"   Загрузка {config['path'].name}...")
+        df_raw = pd.read_csv(config['path'])
+        df_pivoted = load_and_pivot_data(config['path'])
+        
+        dataset_info[key] = {
+            'raw': df_raw,
+            'pivoted': df_pivoted,
+            'dataset': config['dataset'],
+            'var': config['var']
+        }
+    
+    # Шаг 3. Отчеты Excel (1990-2020 гг.)
+    print()
+    generate_excel_reports(dataset_info)
+    
+    # Шаг 3.1 и 3.2. Отчеты Excel только с фактическими данными за весь доступный период
+    print()
+    fact_datasets = load_full_fact_data()
+    if fact_datasets:
+        generate_fact_only_excel_reports(fact_datasets)
+    
+    # Шаг 4. Метрики в txt
+    print()
+    calculate_and_save_metrics(dataset_info)
+    
+    # Шаг 5. Атлас карт
+    print()
+    generate_map_atlas(dataset_info)
+    
+    # Шаг 6. Очистка пустых папок
+    cleanup_empty_folders()
+    
+    print(f"\n>>> РАБОТА ЗАВЕРШЕНА! Отчеты и атлас находятся в: {ANALYTICS_DIR} <<<")
+
+
+if __name__ == "__main__":
+    main()
