@@ -29,7 +29,7 @@ from sklearn.preprocessing import StandardScaler
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
-PROJECT_DIR = Path(r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files")
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 RESULTS_DIR = PROJECT_DIR / "output011_modules"
 EOF_DIR = RESULTS_DIR / "eof_results"
 
@@ -78,10 +78,10 @@ def cleanup_empty_folders():
 
 def load_meteo_ru_monthly():
     """Загружает и агрегирует данные метеостанций РФ из all_steppe_data.txt."""
-    meteo_file = PROJECT_DIR / "метео ру" / "all_steppe_data.txt"
-    coords_file = PROJECT_DIR / "метео ру" / "stations_coords.txt"
+    meteo_file = PROJECT_DIR / "meteo_ru" / "all_steppe_data.txt"
+    coords_file = PROJECT_DIR / "meteo_ru" / "stations_coords.txt"
     if not meteo_file.exists() or not coords_file.exists():
-        raise FileNotFoundError("Файлы данных METEO_RU не найдены в папке 'метео ру'.")
+        raise FileNotFoundError("Файлы данных METEO_RU не найдены в папке 'meteo_ru'.")
     
     cols = ['WMO', 'Year', 'Month', 'Day', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']
     df = pd.read_csv(meteo_file, sep=r'\s+', names=cols, na_values=[-999.9])

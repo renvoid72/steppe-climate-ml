@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
-PROJECT_DIR = Path(r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files")
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 RESULTS_DIR = PROJECT_DIR / "output011_modules"
 CORR_DIR = RESULTS_DIR / "cross_correlation_analysis"
 

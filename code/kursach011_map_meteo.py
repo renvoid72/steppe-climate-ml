@@ -4,13 +4,13 @@ import sys
 import pandas as pd
 
 # Добавляем путь к модулям
-current_dir = Path(__file__).parent
+current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir))
 
 from kursach011_modules.meteo_loader import SteppeClimateLoader
 
-# Твой путь
-PROJECT_DIR = r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files"
+# Корень проекта
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 def main():
     print(">>> ЗАПУСК ТОЛЬКО ГЕНЕРАЦИИ КАРТЫ СТАНЦИЙ <<<\n")

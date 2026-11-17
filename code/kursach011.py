@@ -2,7 +2,7 @@
 from pathlib import Path
 import sys
 
-current_dir = Path(__file__).parent
+current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir))
 
 from kursach011_modules.meteo_loader import SteppeClimateLoader
@@ -10,14 +10,14 @@ from kursach011_modules.cru_loader import CruDataLoader
 from kursach011_modules.forecast_engine import StandardForecaster, LongTermValidator
 from kursach011_modules.visualizer import StandardForecastVisualizer, ValidationVisualizer
 
-PROJECT_DIR = r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files"
-RESULTS_DIR = r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files\output011_modules"
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+RESULTS_DIR = PROJECT_DIR / "output011_modules"
 
 def main():
     print("\n>>> СТАРТ ИНФОРМАЦИОННОЙ СИСТЕМЫ <<<\n")
     
     # 1. ETL (Если нужно)
-    meteo_file = Path(PROJECT_DIR) / "метео ру" / "all_steppe_data.txt"
+    meteo_file = Path(PROJECT_DIR) / "meteo_ru" / "all_steppe_data.txt"
     if not meteo_file.exists():
         SteppeClimateLoader(PROJECT_DIR).run()
     

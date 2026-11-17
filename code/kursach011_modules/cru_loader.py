@@ -23,7 +23,7 @@ class CruDataLoader:
         self.base_dir = Path(base_dir)
         
         # 1. Откуда берем координаты станций (результат работы Meteo Loader)
-        self.coords_file = self.base_dir / "метео ру" / "stations_coords.txt"
+        self.coords_file = self.base_dir / "meteo_ru" / "stations_coords.txt"
         
         # 2. Где лежат исходные карты CRU (NetCDF)
         self.cru_dtr_path = self.base_dir / "cru ceda" / "temp dtr full rus stepp.nc"
@@ -145,6 +145,6 @@ class CruDataLoader:
 
 # Для тестирования (если запускать этот файл отдельно)
 if __name__ == "__main__":
-    PROJECT_DIR = r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files"
+    PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
     loader = CruDataLoader(PROJECT_DIR)
     loader.run()
