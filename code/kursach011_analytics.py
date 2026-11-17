@@ -26,7 +26,7 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
-PROJECT_DIR = Path(r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files")
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 RESULTS_DIR = PROJECT_DIR / "output011_modules"
 ANALYTICS_DIR = RESULTS_DIR / "analytics_reports"
 
@@ -201,8 +201,8 @@ def load_full_fact_data():
     fact_datasets = {}
 
     # 1. Метеостанции РФ
-    meteo_txt = PROJECT_DIR / "метео ру" / "all_steppe_data.txt"
-    coords_txt = PROJECT_DIR / "метео ру" / "stations_coords.txt"
+    meteo_txt = PROJECT_DIR / "meteo_ru" / "all_steppe_data.txt"
+    coords_txt = PROJECT_DIR / "meteo_ru" / "stations_coords.txt"
     if meteo_txt.exists() and coords_txt.exists():
         print("   Загрузка фактических данных Метео РФ (1960-2024 гг.)...")
         cols = ['WMO', 'Year', 'Month', 'Day', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']

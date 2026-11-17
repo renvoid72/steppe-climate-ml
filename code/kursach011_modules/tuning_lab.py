@@ -27,9 +27,9 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 # НАСТРОЙКИ
 # ============================================================================
-BASE_DIR = Path(r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files")
-METEO_DATA_FILE = BASE_DIR / "метео ру" / "all_steppe_data.txt"
-COORDS_FILE = BASE_DIR / "метео ру" / "stations_coords.txt"
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+METEO_DATA_FILE = BASE_DIR / "meteo_ru" / "all_steppe_data.txt"
+COORDS_FILE = BASE_DIR / "meteo_ru" / "stations_coords.txt"
 CRU_FILE = BASE_DIR / "cru ceda" / "cru_aligned_data.csv"
 
 # Ускорение: берем только 25% станций

@@ -81,11 +81,11 @@ class BaseForecaster:
         print(f"  Загрузка данных для {dataset_name}...")
         
         if dataset_name == 'METEO_RU':
-            file_path = self.base_dir / "метео ру" / "all_steppe_data.txt"
-            coords_path = self.base_dir / "метео ру" / "stations_coords.txt"
+            file_path = self.base_dir / "meteo_ru" / "all_steppe_data.txt"
+            coords_path = self.base_dir / "meteo_ru" / "stations_coords.txt"
             
             if not file_path.exists() or not coords_path.exists():
-                print(f"ОШИБКА: Не найдены файлы данных в {self.base_dir}/метео ру")
+                print(f"ОШИБКА: Не найдены файлы данных в {self.base_dir}/meteo_ru")
                 return pd.DataFrame()
 
             cols = ['WMO', 'Year', 'Month', 'Day', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']

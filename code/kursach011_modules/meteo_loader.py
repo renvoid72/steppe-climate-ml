@@ -38,7 +38,7 @@ class SteppeClimateLoader:
         if not self.path_countries.exists():
              self.path_countries = self.base_dir / "maps" / "ne_10m_admin_0_countries.shp"
              
-        self.out_dir = self.base_dir / "метео ру"
+        self.out_dir = self.base_dir / "meteo_ru"
         self.out_dir.mkdir(parents=True, exist_ok=True)
         
         self.file_data = self.out_dir / "all_steppe_data.txt"      
@@ -359,6 +359,6 @@ class SteppeClimateLoader:
             print(f"\n!!! КРИТИЧЕСКАЯ ОШИБКА: {e}")
 
 if __name__ == "__main__":
-    PROJECT_DIR = r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files"
+    PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
     loader = SteppeClimateLoader(PROJECT_DIR)
     loader.run()

@@ -116,11 +116,11 @@ class LSTMFORECASTENGINE:
     def load_data(self, dataset_name):
         """Загрузка и базовая подготовка климатических данных."""
         if dataset_name == 'METEO_RU':
-            file_path = self.base_dir / "метео ру" / "all_steppe_data.txt"
-            coords_path = self.base_dir / "метео ру" / "stations_coords.txt"
+            file_path = self.base_dir / "meteo_ru" / "all_steppe_data.txt"
+            coords_path = self.base_dir / "meteo_ru" / "stations_coords.txt"
             
             if not file_path.exists() or not coords_path.exists():
-                print(f"  ОШИБКА: Файлы данных не найдены в {self.base_dir}/метео ру")
+                print(f"  ОШИБКА: Файлы данных не найдены в {self.base_dir}/meteo_ru")
                 return pd.DataFrame()
 
             cols = ['WMO', 'Year', 'Month', 'Day', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']
@@ -563,7 +563,7 @@ def main():
     print("="*100)
 
     # 1. Проверка ETL (исходных данных)
-    meteo_file = PROJECT_DIR / "метео ру" / "all_steppe_data.txt"
+    meteo_file = PROJECT_DIR / "meteo_ru" / "all_steppe_data.txt"
     if not meteo_file.exists():
         SteppeClimateLoader(PROJECT_DIR).run()
 

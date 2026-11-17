@@ -5,7 +5,7 @@
 замеряет точное время обучения, прогноза, скорость обработки данных и точность (R², MAE, RMSE).
 
 Результаты НЕ сохраняются в CSV, а выгружаются в ЕДИНСТВЕННЫЙ итоговый файл:
-C:\\Users\\defaultuser0\\Desktop\\ucheba\\3 kurs\\kursach\\proga i files\\output011_modules\\forecast_report.txt
+output011_modules/forecast_report.txt (относительно корня проекта)
 """
 
 import sys
@@ -22,7 +22,7 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
-PROJECT_DIR = Path(r"C:\Users\defaultuser0\Desktop\ucheba\3 kurs\kursach\proga i files")
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 RESULTS_DIR = PROJECT_DIR / "output011_modules"
 REPORT_FILE = RESULTS_DIR / "forecast_report.txt"
 
