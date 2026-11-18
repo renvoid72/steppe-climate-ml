@@ -22,6 +22,11 @@ import time
 from pathlib import Path
 import random
 
+if __package__:
+    from .monthly_features import create_time_features
+else:
+    from monthly_features import create_time_features
+
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -61,31 +66,6 @@ PARAM_GRIDS = {
 # ============================================================================
 # ФУНКЦИИ
 # ============================================================================
-def create_time_features(df):
-    """Генерация признаков (Без бинарных флагов дождя)"""
-    df = df.copy()
-    df['Month_sin'] = np.sin(2 * np.pi * df['Date'].dt.month / 12)
-    df['Month_cos'] = np.cos(2 * np.pi * df['Date'].dt.month / 12)
-    
-    df = df.sort_values(by=['WMO', 'Date'])
-    grouped = df.groupby('WMO')
-    
-    # Ищем, какие колонки есть (DTR, Precip, может snow_depth)
-    vars_to_process = [v for v in ['DTR', 'Precip', 'snow_depth'] if v in df.columns]
-    
-    for var in vars_to_process:
-        for lag in [1, 2, 3, 12]: 
-            df[f'{var}_lag_{lag}'] = grouped[var].shift(lag)
-        for window in [3, 6, 12]: 
-            df[f'{var}_roll_mean_{window}'] = grouped[var].shift(1).rolling(window=window, min_periods=1).mean()
-            
-    required_cols = ['DTR_lag_12', 'Precip_lag_12']
-    # Если снег был, требуем и его лаги, чтобы не было дыр
-    if 'snow_depth' in vars_to_process: 
-        if 'snow_depth_lag_12' in df.columns: required_cols.append('snow_depth_lag_12')
-    
-    return df.dropna(subset=required_cols).reset_index(drop=True)
-
 def load_data_sampled(dataset_name):
     print(f"--- Загрузка и сэмплирование: {dataset_name} ---")
     
@@ -179,9 +159,8 @@ def tune_model(dataset_name, target_var, test_years):
                         df_combined = pd.concat([df_history, future], ignore_index=True)
                         df_features = create_time_features(df_combined)
                         
-                        # Train
+                        # Строки с пропусками исключаются только из обучающей выборки.
                         df_train = df_features[df_features['Date'] < forecast_date].dropna().reset_index(drop=True)
-                        # Predict
                         X_pred_input = df_features[df_features['Date'] == forecast_date].reset_index(drop=True).fillna(0)
                         
                         if df_train.empty: continue

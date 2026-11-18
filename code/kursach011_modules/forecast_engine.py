@@ -11,6 +11,8 @@ import warnings
 import sys
 import os
 
+from .monthly_features import create_time_features
+
 warnings.filterwarnings('ignore')
 
 # Параметры (Regression Only)
@@ -124,23 +126,7 @@ class BaseForecaster:
         return df_monthly
 
     def create_features(self, df):
-        df = df.copy()
-        df['Month_sin'] = np.sin(2 * np.pi * df['Date'].dt.month / 12)
-        df['Month_cos'] = np.cos(2 * np.pi * df['Date'].dt.month / 12)
-        
-        df = df.sort_values(by=['WMO', 'Date'])
-        grouped = df.groupby('WMO')
-        
-        vars_to_process = ['DTR', 'Precip']
-        if 'snow_depth' in df.columns: vars_to_process.append('snow_depth')
-
-        for var in vars_to_process:
-            for lag in [1, 2, 3, 12]: 
-                df[f'{var}_lag_{lag}'] = grouped[var].shift(lag)
-            for window in [3, 6, 12]: 
-                df[f'{var}_roll_mean_{window}'] = grouped[var].shift(1).rolling(window=window, min_periods=1).mean()
-        
-        return df
+        return create_time_features(df)
 
     def _fit_predict_model(self, df_train, df_test, model_name, target_var, dataset_name):
         """Инкапсулированная логика обучения одной модели"""
