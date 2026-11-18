@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Регрессионные тесты календарных лагов и скользящих средних.
+Регрессионные тесты календарных лагов, скользящих средних и окон LSTM.
 
 На данных двух станций проверяются пропуск месяца, границы окон и
 сохранение строки прогноза. Тесты запускаются без обучения моделей.
 """
 
 import unittest
+from importlib.util import find_spec
 from tempfile import TemporaryDirectory
 
+import numpy as np
 import pandas as pd
 from pandas.testing import assert_frame_equal
 
@@ -84,6 +86,71 @@ class MonthlyFeaturesTest(unittest.TestCase):
         self.assertEqual(march['snow_depth_lag_12'], 1)
         self.assertTrue(pd.isna(march['snow_depth_roll_mean_3']))
         self.assertEqual(march['snow_depth_roll_mean_6'], 9)
+
+
+@unittest.skipUnless(find_spec('torch') is not None, 'Для тестов LSTM требуется PyTorch')
+class LSTMCalendarWindowsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from kursach011_lstm import LSTMFORECASTENGINE
+
+        cls.engine = LSTMFORECASTENGINE(lookback_window=12)
+
+    def setUp(self):
+        dates = pd.date_range('2023-01-01', '2025-04-01', freq='MS')
+        self.source = pd.DataFrame(
+            [
+                (wmo, date, dtr, dtr * 2, latitude, 60.0)
+                for wmo, offset, latitude in [('A', 10, 45.0), ('B', 100, 50.0)]
+                for dtr, date in enumerate(dates, start=offset)
+                if not (wmo == 'A' and date == pd.Timestamp('2024-02-01'))
+            ],
+            columns=['WMO', 'Date', 'DTR', 'Precip', 'Latitude', 'Longitude'],
+        ).sample(frac=1, random_state=42)
+
+    def test_lstm_skips_the_gap_and_resumes_after_twelve_months(self):
+        _, _, dates, stations, _, _ = self.engine._build_sequences(self.source, 'DTR')
+        pd.testing.assert_index_equal(
+            pd.DatetimeIndex(dates[stations == 'A']),
+            pd.DatetimeIndex(['2024-01-01', '2025-03-01', '2025-04-01']),
+        )
+        pd.testing.assert_index_equal(
+            pd.DatetimeIndex(dates[stations == 'B']),
+            pd.date_range('2024-01-01', '2025-04-01', freq='MS'),
+        )
+
+    def test_lstm_window_uses_its_station_and_excludes_the_target_month(self):
+        target_date = pd.Timestamp('2025-03-01')
+        history_dates = pd.date_range('2024-03-01', '2025-02-01', freq='MS')
+        observed = self.source.set_index(['WMO', 'Date'])
+
+        for target in ('DTR', 'Precip'):
+            windows, values, dates, stations, _, _ = self.engine._build_sequences(self.source, target)
+            for station in ('A', 'B'):
+                with self.subTest(target=target, station=station):
+                    is_target = (dates == target_date) & (stations == station)
+                    np.testing.assert_array_equal(
+                        values[is_target], [observed.loc[(station, target_date), target]]
+                    )
+
+                    history = observed.loc[station].loc[history_dates]
+                    expected = history.assign(Precip=np.log1p(history['Precip']))
+                    columns = ['DTR', 'Precip'] if target == 'DTR' else ['Precip', 'DTR']
+                    np.testing.assert_allclose(
+                        windows[is_target, :, :2], [expected[columns].to_numpy()]
+                    )
+
+    def test_lstm_keeps_tensor_and_date_types_when_all_windows_cross_a_gap(self):
+        sparse = self.source.loc[
+            (self.source['WMO'] == 'A') & self.source['Date'].between('2023-03-01', '2025-02-01')
+        ]
+        windows, values, dates, stations, latitudes, longitudes = self.engine._build_sequences(
+            sparse, 'DTR'
+        )
+        self.assertEqual(windows.shape, (0, 12, 6))
+        self.assertEqual(windows.dtype, np.float32)
+        self.assertTrue(np.issubdtype(dates.dtype, np.datetime64))
+        self.assertTrue(all(array.shape == (0,) for array in (values, dates, stations, latitudes, longitudes)))
 
 
 if __name__ == '__main__':

@@ -4,6 +4,7 @@
  Скрипт глубокого обучения (Deep Learning / LSTM) для климатического прогнозирования
  Проект: Исследование климатических показателей степной зоны РФ (Версия 011)
  Модель: Long Short-Term Memory (LSTM Neural Network на PyTorch)
+ Входное окно состоит из последовательных календарных месяцев одной станции.
 ================================================================================
 """
 
@@ -33,9 +34,7 @@ STD_CSV_DIR = RESULTS_DIR / "standard_forecast" / "csv_data"
 VAL_CSV_DIR = RESULTS_DIR / "validation_results" / "csv_data"
 REPORT_FILE = RESULTS_DIR / "forecast_report.txt"
 
-# Создание структуры каталогов
-for d in [STD_CSV_DIR, VAL_CSV_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
+FORECAST_COLUMNS = ['Date', 'WMO', 'Latitude', 'Longitude', 'Forecast', 'Fact', 'Model', 'Target_Var']
 
 # Подключение путей для импорта
 for p in [str(CODE_DIR), str(MODULES_DIR), str(PROJECT_DIR)]:
@@ -162,10 +161,8 @@ class LSTMFORECASTENGINE:
         return df
 
     def _build_sequences(self, df, target_var):
-        """
-        Формирование 3D-тензоров скользящего окна (Lookback Window = 12) для всех станций.
-        """
-        df = self._prepare_features_df(df)
+        """Формирует входные окна из непрерывных месяцев перед целевой датой."""
+        df = self._prepare_features_df(df.sort_values(['WMO', 'Date']))
         
         # Подготовка признаков: целевая + ко-переменная + календарь + координаты
         if target_var == 'DTR':
@@ -189,18 +186,14 @@ class LSTMFORECASTENGINE:
         ])
 
         dates_all = df['Date'].values
-        wmo_all = df['WMO'].values
+        months_all = (df['Date'].dt.year * 12 + df['Date'].dt.month).to_numpy()
+        wmo_all = df['WMO'].to_numpy()
         lat_all = df['Latitude'].values
         lon_all = df['Longitude'].values
 
         X_list, y_list, date_list, wmo_list, lat_list, lon_list = [], [], [], [], [], []
 
-        # Группировка по станциям для непрерывности временного ряда
-        unique_wmo, group_idx = np.unique(wmo_all, return_index=True)
-        sort_idx = np.argsort(group_idx)
-        unique_wmo = unique_wmo[sort_idx]
-
-        for w in unique_wmo:
+        for w in np.unique(wmo_all):
             mask = (wmo_all == w)
             w_feats = features_raw[mask]
             w_dates = dates_all[mask]
@@ -212,7 +205,10 @@ class LSTMFORECASTENGINE:
             if n_records <= self.lookback:
                 continue
 
-            for i in range(self.lookback, n_records):
+            # Проверяем все переходы от начала окна до целевого месяца.
+            consecutive_months = np.diff(months_all[mask]) == 1
+            steps = np.lib.stride_tricks.sliding_window_view(consecutive_months, self.lookback)
+            for i in np.flatnonzero(steps.all(axis=1)) + self.lookback:
                 X_list.append(w_feats[i - self.lookback:i])
                 y_list.append(w_targets[i])
                 date_list.append(w_dates[i])
@@ -220,10 +216,10 @@ class LSTMFORECASTENGINE:
                 lat_list.append(w_lats[i])
                 lon_list.append(w_lons[i])
 
-        X_arr = np.array(X_list, dtype=np.float32)
+        X_arr = np.array(X_list, dtype=np.float32).reshape(-1, self.lookback, features_raw.shape[1])
         y_arr = np.array(y_list, dtype=np.float32)
-        date_arr = np.array(date_list)
-        wmo_arr = np.array(wmo_list)
+        date_arr = np.array(date_list, dtype=dates_all.dtype)
+        wmo_arr = np.array(wmo_list, dtype=wmo_all.dtype)
         lat_arr = np.array(lat_list, dtype=np.float32)
         lon_arr = np.array(lon_list, dtype=np.float32)
 
@@ -309,6 +305,7 @@ class LSTMFORECASTENGINE:
         if df_full.empty:
             return
 
+        STD_CSV_DIR.mkdir(parents=True, exist_ok=True)
         for target_var in ['DTR', 'Precip']:
             fname = f"{dataset_name}_{target_var}_{target_year}.csv"
             print(f"\n---> Параметр: {target_var} <---")
@@ -375,9 +372,9 @@ class LSTMFORECASTENGINE:
             # Метрики
             clean_facts = np.array(all_facts)
             clean_preds = np.array(all_preds)
-            r2 = r2_score(clean_facts, clean_preds) if len(clean_facts) > 0 else 0.0
-            mae = mean_absolute_error(clean_facts, clean_preds) if len(clean_facts) > 0 else 0.0
-            rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if len(clean_facts) > 0 else 0.0
+            r2 = r2_score(clean_facts, clean_preds) if clean_facts.size > 1 else np.nan
+            mae = mean_absolute_error(clean_facts, clean_preds) if clean_facts.size else np.nan
+            rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if clean_facts.size else np.nan
 
             speed_samples_sec = total_samples / total_pred_time if total_pred_time > 0 else 0.0
             total_time = total_fit_time + total_pred_time
@@ -389,7 +386,7 @@ class LSTMFORECASTENGINE:
             print(f"    - Метрики точности:               R² = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
 
             # Сохранение CSV
-            df_out = pd.DataFrame(all_res_rows)
+            df_out = pd.DataFrame(all_res_rows, columns=FORECAST_COLUMNS)
             df_out.to_csv(STD_CSV_DIR / fname, index=False)
 
             self.summary_table.append({
@@ -426,6 +423,7 @@ class LSTMFORECASTENGINE:
         final_year = min(end_year, data_max_year)
         test_years = list(range(split_year, final_year + 1))
 
+        VAL_CSV_DIR.mkdir(parents=True, exist_ok=True)
         for target_var in ['DTR', 'Precip']:
             fname = f"Validation_{dataset_name}_{target_var}_{split_year}-{final_year}.csv"
             print(f"\n---> Параметр: {target_var} <---")
@@ -496,9 +494,9 @@ class LSTMFORECASTENGINE:
             # Итоговые метрики за 30 лет
             clean_facts = np.array(all_facts)
             clean_preds = np.array(all_preds)
-            r2 = r2_score(clean_facts, clean_preds) if len(clean_facts) > 0 else 0.0
-            mae = mean_absolute_error(clean_facts, clean_preds) if len(clean_facts) > 0 else 0.0
-            rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if len(clean_facts) > 0 else 0.0
+            r2 = r2_score(clean_facts, clean_preds) if clean_facts.size > 1 else np.nan
+            mae = mean_absolute_error(clean_facts, clean_preds) if clean_facts.size else np.nan
+            rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if clean_facts.size else np.nan
 
             speed_samples_sec = total_samples / total_pred_time if total_pred_time > 0 else 0.0
             total_time = total_fit_time + total_pred_time
@@ -510,7 +508,7 @@ class LSTMFORECASTENGINE:
             print(f"    - Метрики точности:               R² = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
 
             # Сохранение CSV
-            df_out = pd.DataFrame(all_res_rows)
+            df_out = pd.DataFrame(all_res_rows, columns=FORECAST_COLUMNS)
             df_out.to_csv(VAL_CSV_DIR / fname, index=False)
 
             self.summary_table.append({
