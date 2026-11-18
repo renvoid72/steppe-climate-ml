@@ -23,9 +23,9 @@ from pathlib import Path
 import random
 
 if __package__:
-    from .monthly_features import create_time_features
+    from .monthly_features import create_forecast_features, model_feature_columns, select_model_rows
 else:
-    from monthly_features import create_time_features
+    from monthly_features import create_forecast_features, model_feature_columns, select_model_rows
 
 warnings.filterwarnings('ignore')
 
@@ -116,7 +116,7 @@ def tune_model(dataset_name, target_var, test_years):
     print(f"{'='*60}")
 
     df_full = load_data_sampled(dataset_name)
-    actuals = df_full[df_full['Year'].isin(test_years)].groupby('Date')[target_var].mean()
+    actuals = df_full.loc[df_full['Year'].isin(test_years), ['Date', 'WMO', target_var]].dropna(subset=[target_var])
     
     if actuals.empty:
         print("ОШИБКА: Нет данных для теста!")
@@ -141,36 +141,27 @@ def tune_model(dataset_name, target_var, test_years):
         for i, params in enumerate(search_combinations):
             start_time = time.time()
             all_preds = []
+            all_facts = []
             
             try:
                 # Walk-Forward Loop
                 for year in sorted(test_years):
                     for month in range(1, 13):
                         forecast_date = pd.to_datetime(f"{year}-{month}-01")
-                        
-                        df_history = df_full[df_full['Date'] < forecast_date].copy()
-                        
-                        stations = df_history[['WMO', 'Latitude', 'Longitude']].drop_duplicates()
-                        future = stations.copy()
-                        future['Date'] = forecast_date
-                        for c in ['DTR', 'Precip']: 
-                            if c in df_history.columns: future[c] = np.nan
-                        
-                        df_combined = pd.concat([df_history, future], ignore_index=True)
-                        df_features = create_time_features(df_combined)
-                        
-                        # Строки с пропусками исключаются только из обучающей выборки.
-                        df_train = df_features[df_features['Date'] < forecast_date].dropna().reset_index(drop=True)
-                        X_pred_input = df_features[df_features['Date'] == forecast_date].reset_index(drop=True).fillna(0)
-                        
-                        if df_train.empty: continue
+
+                        df_features = create_forecast_features(df_full, forecast_date)
+                        df_train = select_model_rows(df_features[df_features['Date'] < forecast_date], target_var)
+                        df_pred = select_model_rows(df_features[df_features['Date'] == forecast_date])
+                        facts = actuals[actuals['Date'] == forecast_date].set_index('WMO')[target_var]
+                        df_pred = df_pred[df_pred['WMO'].isin(facts.index)]
+
+                        if df_pred.empty or len(df_train) < params.get('n_neighbors', 1):
+                            continue
 
                         model_args = {'random_state': 42} if 'Random' in model_name or 'MLP' in model_name else {}
                         if 'Random' in model_name or 'Neighbors' in model_name: model_args['n_jobs'] = -1
                         
-                        # Колонки для обучения (без классификаторов)
-                        cols_exclude = ['Date', 'WMO', 'Year', 'Month', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip', 'DTR', 'Latitude', 'Longitude']
-                        feature_cols = [c for c in df_train.columns if c not in cols_exclude]
+                        feature_cols = model_feature_columns(df_train)
 
                         model = reg_class(**params, **model_args)
                         scaler = StandardScaler().fit(df_train[feature_cols])
@@ -183,7 +174,7 @@ def tune_model(dataset_name, target_var, test_years):
                             
                         model.fit(scaler.transform(df_train[feature_cols]), y_train)
                         
-                        raw_preds = model.predict(scaler.transform(X_pred_input[feature_cols]))
+                        raw_preds = model.predict(scaler.transform(df_pred[feature_cols]))
                         
                         # Обратное преобразование
                         if target_var == 'Precip':
@@ -191,19 +182,16 @@ def tune_model(dataset_name, target_var, test_years):
                         else:
                             val = np.mean(raw_preds)
                         
-                        val = max(0, val)
-                        all_preds.append(pd.Series([val], index=[forecast_date]))
+                        all_preds.append(max(0, val))
+                        all_facts.append(facts.loc[df_pred['WMO']].mean())
 
                 if all_preds:
-                    full_preds = pd.concat(all_preds)
-                    act, pred = actuals.align(full_preds.squeeze(), join='inner')
-                    if len(act) > 0:
-                        r2 = r2_score(act, pred)
-                        mae = mean_absolute_error(act, pred)
-                        print(f"  [{i+1}/{N_ITER}] R2={r2:.4f} | MAE={mae:.3f} | {params} ({time.time()-start_time:.1f}s)")
-                        
-                        if r2 > best_score:
-                            best_score, best_params = r2, params
+                    r2 = r2_score(all_facts, all_preds) if len(all_preds) > 1 else np.nan
+                    mae = mean_absolute_error(all_facts, all_preds)
+                    print(f"  [{i+1}/{N_ITER}] R2={r2:.4f} | MAE={mae:.3f} | {params} ({time.time()-start_time:.1f}s)")
+
+                    if r2 > best_score:
+                        best_score, best_params = r2, params
             except Exception as e:
                 print(f"  [{i+1}/{N_ITER}] ОШИБКА: {e}")
 

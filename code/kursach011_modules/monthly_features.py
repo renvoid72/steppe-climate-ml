@@ -11,6 +11,31 @@ import numpy as np
 import pandas as pd
 
 
+def model_feature_columns(df):
+    """Выбирает колонки, которые получает модель вместо исходных значений месяца."""
+    excluded = {
+        'Date', 'WMO', 'Year', 'Month', 'Quality', 'Tmin', 'Tavg', 'Tmax',
+        'DTR', 'Precip', 'snow_depth', 'Latitude', 'Longitude',
+    }
+    return [column for column in df.columns if column not in excluded]
+
+
+def select_model_rows(df, target_var=None):
+    """Оставляет строки с полными признаками и, если нужно, с известной целью."""
+    required = model_feature_columns(df)
+    if target_var is not None:
+        required.append(target_var)
+    return df.dropna(subset=required)
+
+
+def create_forecast_features(df, forecast_date):
+    """Рассчитывает признаки для истории и целевого месяца без его наблюдений."""
+    history = df.loc[df['Date'] < forecast_date]
+    future = history[['WMO', 'Latitude', 'Longitude']].drop_duplicates().copy()
+    future['Date'] = forecast_date
+    return create_time_features(pd.concat([history, future], ignore_index=True))
+
+
 def create_time_features(df):
     """Добавляет временные признаки к таблице с одной строкой на станцию и месяц."""
     df = df.sort_values(['WMO', 'Date']).copy()

@@ -15,7 +15,7 @@ import pandas as pd
 from pandas.testing import assert_frame_equal
 
 from kursach011_modules.forecast_engine import BaseForecaster
-from kursach011_modules.tuning_lab import create_time_features
+from kursach011_modules.monthly_features import create_time_features
 
 
 class MonthlyFeaturesTest(unittest.TestCase):
@@ -63,11 +63,11 @@ class MonthlyFeaturesTest(unittest.TestCase):
         for window in (3, 6, 12):
             self.assertEqual(april_b[f'DTR_roll_mean_{window}'], 900)
 
-    def test_both_entry_points_preserve_the_forecast_row(self):
-        tuning_features = create_time_features(self.source)
-        assert_frame_equal(self.engine_features, tuning_features)
+    def test_feature_creation_preserves_the_forecast_row(self):
+        features = create_time_features(self.source)
+        assert_frame_equal(self.engine_features, features)
         assert_frame_equal(
-            tuning_features[self.source.columns], self.source.sort_values(['WMO', 'Date'])
+            features[self.source.columns], self.source.sort_values(['WMO', 'Date'])
         )
 
         future = self.features.loc[('B', pd.Timestamp('2024-05-01'))]
