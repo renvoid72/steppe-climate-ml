@@ -18,6 +18,28 @@
 
 Данные и сгенерированные результаты хранятся локально. Правила исключения описаны в [`.gitignore`](.gitignore).
 
+## Установка на Windows
+
+Установка проверена на 64-разрядной Windows с Python 3.14.0. Выполни команды в CMD из корня проекта.
+
+```cmd
+py -3.14 -m venv .venv
+.venv\Scripts\activate.bat
+python -m pip install -r requirements.txt
+python -m pip check
+```
+
+Если `.venv` уже создана на Python 3.14, начни с её активации.
+
+Для запуска [LSTM](code/kursach011_lstm.py) дополнительно установи сборку PyTorch для процессора в этом же окружении.
+
+```cmd
+python -m pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+python -c "import torch; print(torch.__version__)"
+```
+
+Варианты сборок для других устройств перечислены в [инструкции PyTorch](https://pytorch.org/get-started/previous-versions/).
+
 ## Запуск
 
 Корень проекта определяется по расположению Python-файлов. Пути к данным и результатам вычисляются относительно этого корня, поэтому скрипты можно вызывать из другой рабочей папки, указав путь к скрипту.

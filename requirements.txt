@@ -1,0 +1,19 @@
+# Расчёты, загрузка наблюдений и графики
+matplotlib==3.10.7
+meteostat==1.7.6
+numpy==2.3.4
+pandas==2.3.3
+scikit-learn==1.7.2
+scipy==1.16.3
+
+# ГИС, NetCDF и отчёты
+dask==2025.12.0
+geopandas==1.1.1
+netCDF4==1.7.3
+openpyxl==3.1.5
+Pillow==12.0.0
+pyogrio==0.12.1
+rasterio==1.4.4
+rioxarray==0.20.0
+shapely==2.1.2
+xarray==2025.10.1
