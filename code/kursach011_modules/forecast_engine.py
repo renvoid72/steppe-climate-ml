@@ -7,13 +7,20 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_absolute_error
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import warnings
-import sys
-import os
 
-from .monthly_features import create_time_features
+from .monthly_features import (
+    create_forecast_features,
+    create_time_features,
+    model_feature_columns,
+    select_model_rows,
+)
 
 warnings.filterwarnings('ignore')
+
+FORECAST_COLUMNS = ['Date', 'WMO', 'Latitude', 'Longitude', 'Forecast', 'Fact', 'Model', 'Target_Var']
+HISTORY_POLICY = 'complete_features'
 
 # Параметры (Regression Only)
 BEST_PARAMS = {
@@ -61,23 +68,37 @@ class BaseForecaster:
         print(f"[{self.__class__.__name__}] Инициализирован. Папка: {self.output_dir}")
 
     def _is_file_valid(self, filename):
-        """Проверяет, существует ли файл и содержит ли он нужные данные"""
-        filepath = self.output_dir / filename
-        if not filepath.exists():
-            return False
-        
+        """Проверяет, сохранены ли прогнозы с действующим правилом отбора строк."""
         try:
-            # Читаем только заголовок, чтобы было быстро
-            df = pd.read_csv(filepath, nrows=5)
-            required_cols = ['Date', 'WMO', 'Forecast', 'Fact', 'Model']
-            
-            # Если всех нужных колонок нет - файл невалиден
-            if not all(col in df.columns for col in required_cols):
-                return False
-                
-            return True
-        except:
+            df = pd.read_csv(self.output_dir / filename, nrows=1)
+        except (OSError, ValueError):
             return False
+
+        return (
+            not df.empty
+            and set(FORECAST_COLUMNS).issubset(df.columns)
+            and 'History_Policy' in df.columns
+            and df['History_Policy'].iat[0] == HISTORY_POLICY
+        )
+
+    def _save_predictions(self, predictions, filename):
+        df = pd.concat(predictions) if predictions else pd.DataFrame(columns=FORECAST_COLUMNS)
+        df['History_Policy'] = HISTORY_POLICY
+        with TemporaryDirectory(dir=self.output_dir) as temp_dir:
+            temp_file = Path(temp_dir) / filename
+            df.to_csv(temp_file, index=False)
+            temp_file.replace(self.output_dir / filename)
+
+    def _can_predict(self, df_train, df_test, model_name, target_var, dataset_name):
+        params = BEST_PARAMS[dataset_name][target_var][model_name]
+        return not df_test.empty and len(df_train) >= params.get('n_neighbors', 1)
+
+    @staticmethod
+    def _print_coverage(candidates, eligible, predicted, paired):
+        print(
+            f"кандидатов: {candidates}, допущено: {eligible}, исключено: {candidates - eligible}, "
+            f"прогнозов: {predicted}, пар с фактом: {paired}"
+        )
 
     def load_data(self, dataset_name):
         print(f"  Загрузка данных для {dataset_name}...")
@@ -132,8 +153,7 @@ class BaseForecaster:
         """Инкапсулированная логика обучения одной модели"""
         params = BEST_PARAMS[dataset_name][target_var][model_name]
         
-        cols_exclude = ['Date', 'WMO', 'Year', 'Month', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip', 'DTR', 'Latitude', 'Longitude']
-        feature_cols = [c for c in df_train.columns if c not in cols_exclude]
+        feature_cols = model_feature_columns(df_train)
         
         scaler = StandardScaler().fit(df_train[feature_cols])
         
@@ -173,30 +193,29 @@ class StandardForecaster(BaseForecaster):
             
             if df_full.empty: return
 
-            # Получаем реальные данные для сравнения
-            actuals = df_full[df_full['Year'] == target_year].groupby('Date')
-
             print(f"\n>>> Стандартный прогноз: {target_var} на {target_year} ({dataset_name}) <<<")
             all_predictions = []
             
             for model_name in self.model_classes.keys():
                 print(f"  Модель: {model_name}...", end=" ", flush=True)
-                preds_list = []
+                model_results = []
+                candidate_count = 0
+                eligible_count = 0
                 
                 # Walk-Forward по месяцам
                 for month_num in range(1, 13):
                     forecast_date = pd.to_datetime(f"{target_year}-{month_num}-01")
                     
-                    df_hist = df_full[df_full['Date'] < forecast_date].copy()
-                    future = df_hist[['WMO', 'Latitude', 'Longitude']].drop_duplicates()
-                    future['Date'] = forecast_date
-                    for c in ['DTR', 'Precip']: future[c] = np.nan
+                    df_features = create_forecast_features(df_full, forecast_date)
                     
-                    df_combined = pd.concat([df_hist, future], ignore_index=True)
-                    df_features = self.create_features(df_combined)
-                    
-                    df_train = df_features[df_features['Date'] < forecast_date].dropna().reset_index(drop=True)
-                    df_pred = df_features[df_features['Date'] == forecast_date].fillna(0)
+                    df_train = select_model_rows(df_features[df_features['Date'] < forecast_date], target_var)
+                    candidates = df_features[df_features['Date'] == forecast_date]
+                    df_pred = select_model_rows(candidates)
+                    candidate_count += len(candidates)
+                    eligible_count += len(df_pred)
+
+                    if not self._can_predict(df_train, df_pred, model_name, target_var, dataset_name):
+                        continue
                     
                     preds = self._fit_predict_model(df_train, df_pred, model_name, target_var, dataset_name)
                     
@@ -210,23 +229,32 @@ class StandardForecaster(BaseForecaster):
                     
                     res['Model'] = model_name
                     res['Target_Var'] = target_var
-                    all_predictions.append(res)
-                    preds_list.append(pd.Series([np.mean(preds)], index=[forecast_date]))
-                
-                # Вывод метрик
-                model_year_preds = pd.concat(preds_list)
-                act_year = actuals[target_var].mean()
-                
-                aligned_act, aligned_pred = act_year.align(model_year_preds.squeeze(), join='inner')
-                if not aligned_act.empty:
-                    r2 = r2_score(aligned_act, aligned_pred)
-                    mae = mean_absolute_error(aligned_act, aligned_pred)
-                    print(f"R²={r2:.4f}, MAE={mae:.4f}")
-                else:
-                    print("Готово")
+                    model_results.append(res)
+
+                self._print_coverage(
+                    candidate_count,
+                    eligible_count,
+                    sum(len(result) for result in model_results),
+                    sum(result['Fact'].count() for result in model_results),
+                )
+
+                if not model_results:
+                    print("    Нет строк для прогноза.")
+                    continue
+
+                model_predictions = pd.concat(model_results)
+                all_predictions.append(model_predictions)
+                estimated = model_predictions.dropna(subset=['Fact'])
+                monthly = estimated.groupby('Date')[['Fact', 'Forecast']].mean()
+                if monthly.empty:
+                    print("    Нет фактов для оценки.")
+                    continue
+
+                r2 = r2_score(monthly['Fact'], monthly['Forecast']) if len(monthly) > 1 else np.nan
+                mae = mean_absolute_error(monthly['Fact'], monthly['Forecast'])
+                print(f"    R2={r2:.4f}, MAE={mae:.4f}")
             
-            final_df = pd.concat(all_predictions)
-            final_df.to_csv(self.output_dir / fname, index=False)
+            self._save_predictions(all_predictions, fname)
             print(f"  -> Сохранено: {fname}")
 
 # ============================================================================
@@ -268,6 +296,8 @@ class LongTermValidator(BaseForecaster):
                 
                 model_full_preds = []
                 model_full_facts = []
+                candidate_count = 0
+                eligible_count = 0
 
                 # Yearly Walk-Forward
                 for year in test_years:
@@ -277,10 +307,14 @@ class LongTermValidator(BaseForecaster):
                     df_current_slice = df_full[df_full['Year'] <= year].copy()
                     df_features = self.create_features(df_current_slice)
                     
-                    df_train = df_features[df_features['Date'] < split_date].dropna().reset_index(drop=True)
-                    df_test = df_features[df_features['Year'] == year].reset_index(drop=True).fillna(0)
+                    df_train = select_model_rows(df_features[df_features['Date'] < split_date], target_var)
+                    candidates = df_features[df_features['Year'] == year]
+                    df_test = select_model_rows(candidates, target_var)
+                    candidate_count += len(candidates)
+                    eligible_count += len(df_test)
                     
-                    if df_train.empty or df_test.empty: continue
+                    if not self._can_predict(df_train, df_test, model_name, target_var, dataset_name):
+                        continue
 
                     preds = self._fit_predict_model(df_train, df_test, model_name, target_var, dataset_name)
                     
@@ -293,14 +327,15 @@ class LongTermValidator(BaseForecaster):
                     
                     model_full_preds.extend(preds)
                     model_full_facts.extend(df_test[target_var].values)
-                
-                if model_full_preds:
-                    r2 = r2_score(model_full_facts, model_full_preds)
-                    mae = mean_absolute_error(model_full_facts, model_full_preds)
-                    print(f" | Avg R²={r2:.4f}, Avg MAE={mae:.4f}")
-                else:
-                    print(" | Нет данных.")
 
-            final_df = pd.concat(all_predictions)
-            final_df.to_csv(self.output_dir / fname, index=False)
+                self._print_coverage(candidate_count, eligible_count, len(model_full_preds), len(model_full_facts))
+
+                if model_full_preds:
+                    r2 = r2_score(model_full_facts, model_full_preds) if len(model_full_preds) > 1 else np.nan
+                    mae = mean_absolute_error(model_full_facts, model_full_preds)
+                    print(f"      Avg R2={r2:.4f}, Avg MAE={mae:.4f}")
+                else:
+                    print("      Нет данных.")
+
+            self._save_predictions(all_predictions, fname)
             print(f"  -> Результаты валидации сохранены в {fname}")

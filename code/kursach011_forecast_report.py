@@ -2,7 +2,7 @@
 """
 Автономный скрипт для расширенного хронометрического и аналитического отчета.
 Выполняет обучение и прогнозирование с помощью моделей Random Forest, K-Neighbors и MLP,
-замеряет точное время обучения, прогноза, скорость обработки данных и точность (R², MAE, RMSE).
+замеряет точное время обучения, прогноза, скорость обработки данных и точность (R2, MAE, RMSE).
 
 Результаты НЕ сохраняются в CSV, а выгружаются в ЕДИНСТВЕННЫЙ итоговый файл:
 output011_modules/forecast_report.txt (относительно корня проекта)
@@ -30,6 +30,7 @@ REPORT_FILE = RESULTS_DIR / "forecast_report.txt"
 sys.path.append(str(PROJECT_DIR / "code"))
 
 from kursach011_modules.forecast_engine import BaseForecaster, BEST_PARAMS
+from kursach011_modules.monthly_features import create_forecast_features, model_feature_columns, select_model_rows
 
 
 class DualLogger:
@@ -69,8 +70,7 @@ class ForecastReporter(BaseForecaster):
         """
         params = BEST_PARAMS[dataset_name][target_var][model_name]
         
-        cols_exclude = ['Date', 'WMO', 'Year', 'Month', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip', 'DTR', 'Latitude', 'Longitude']
-        feature_cols = [c for c in df_train.columns if c not in cols_exclude]
+        feature_cols = model_feature_columns(df_train)
         
         scaler = StandardScaler().fit(df_train[feature_cols])
         
@@ -119,8 +119,6 @@ class ForecastReporter(BaseForecaster):
 
         for target_var in ['DTR', 'Precip']:
             print(f"\n---> Параметр: {target_var} <---")
-            actuals = df_full[df_full['Year'] == target_year].groupby('Date')
-
             for model_name in self.model_classes.keys():
                 print(f"\n  * Модель: {model_name}")
                 
@@ -134,19 +132,12 @@ class ForecastReporter(BaseForecaster):
                 for month_num in range(1, 13):
                     forecast_date = pd.to_datetime(f"{target_year}-{month_num:02d}-01")
                     
-                    df_hist = df_full[df_full['Date'] < forecast_date].copy()
-                    future = df_hist[['WMO', 'Latitude', 'Longitude']].drop_duplicates()
-                    future['Date'] = forecast_date
-                    for c in ['DTR', 'Precip']:
-                        future[c] = np.nan
+                    df_features = create_forecast_features(df_full, forecast_date)
+
+                    df_train = select_model_rows(df_features[df_features['Date'] < forecast_date], target_var)
+                    df_pred = select_model_rows(df_features[df_features['Date'] == forecast_date])
                     
-                    df_combined = pd.concat([df_hist, future], ignore_index=True)
-                    df_features = self.create_features(df_combined)
-                    
-                    df_train = df_features[df_features['Date'] < forecast_date].dropna().reset_index(drop=True)
-                    df_pred = df_features[df_features['Date'] == forecast_date].fillna(0)
-                    
-                    if df_train.empty or df_pred.empty:
+                    if not self._can_predict(df_train, df_pred, model_name, target_var, dataset_name):
                         continue
 
                     preds, fit_t, pred_t, n_samp = self._timed_fit_predict(
@@ -169,9 +160,9 @@ class ForecastReporter(BaseForecaster):
                 clean_facts = np.array(all_facts)[valid_mask]
                 clean_preds = np.array(all_preds)[valid_mask]
 
-                r2 = r2_score(clean_facts, clean_preds) if len(clean_facts) > 0 else 0.0
-                mae = mean_absolute_error(clean_facts, clean_preds) if len(clean_facts) > 0 else 0.0
-                rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if len(clean_facts) > 0 else 0.0
+                r2 = r2_score(clean_facts, clean_preds) if len(clean_facts) > 1 else np.nan
+                mae = mean_absolute_error(clean_facts, clean_preds) if len(clean_facts) else np.nan
+                rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if len(clean_facts) else np.nan
                 
                 speed_samples_sec = total_samples / total_predict_time if total_predict_time > 0 else 0.0
                 total_time = total_fit_time + total_predict_time
@@ -180,7 +171,7 @@ class ForecastReporter(BaseForecaster):
                 print(f"    - Время прогноза (Predict Time):  {total_predict_time:.4f} сек")
                 print(f"    - Суммарное время (Total Time):   {total_time:.4f} сек")
                 print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_predict_time/12:.4f} сек/месяц)")
-                print(f"    - Метрики точности:               R² = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
+                print(f"    - Метрики точности:               R2 = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
 
                 self.summary_table.append({
                     'Блок': 'Стандартный прогноз',
@@ -191,7 +182,7 @@ class ForecastReporter(BaseForecaster):
                     'Predict Time (с)': round(total_predict_time, 4),
                     'Total Time (с)': round(total_time, 4),
                     'Скорость (зап/с)': round(speed_samples_sec, 2),
-                    'R²': round(r2, 4),
+                    'R2': round(r2, 4),
                     'MAE': round(mae, 4),
                     'RMSE': round(rmse, 4)
                 })
@@ -215,6 +206,10 @@ class ForecastReporter(BaseForecaster):
         final_year = min(end_year, data_max_year)
         test_years = list(range(split_year, final_year + 1))
 
+        if not test_years:
+            print("  Нет годов для валидации.")
+            return
+
         for target_var in ['DTR', 'Precip']:
             print(f"\n---> Параметр: {target_var} <---")
 
@@ -234,10 +229,10 @@ class ForecastReporter(BaseForecaster):
                     df_current_slice = df_full[df_full['Year'] <= year].copy()
                     df_features = self.create_features(df_current_slice)
                     
-                    df_train = df_features[df_features['Date'] < split_date].dropna().reset_index(drop=True)
-                    df_test = df_features[df_features['Year'] == year].reset_index(drop=True).fillna(0)
+                    df_train = select_model_rows(df_features[df_features['Date'] < split_date], target_var)
+                    df_test = select_model_rows(df_features[df_features['Year'] == year], target_var)
                     
-                    if df_train.empty or df_test.empty:
+                    if not self._can_predict(df_train, df_test, model_name, target_var, dataset_name):
                         continue
 
                     preds, fit_t, pred_t, n_samp = self._timed_fit_predict(
@@ -255,9 +250,9 @@ class ForecastReporter(BaseForecaster):
                 clean_facts = np.array(all_facts)
                 clean_preds = np.array(all_preds)
 
-                r2 = r2_score(clean_facts, clean_preds) if len(clean_facts) > 0 else 0.0
-                mae = mean_absolute_error(clean_facts, clean_preds) if len(clean_facts) > 0 else 0.0
-                rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if len(clean_facts) > 0 else 0.0
+                r2 = r2_score(clean_facts, clean_preds) if len(clean_facts) > 1 else np.nan
+                mae = mean_absolute_error(clean_facts, clean_preds) if len(clean_facts) else np.nan
+                rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if len(clean_facts) else np.nan
 
                 speed_samples_sec = total_samples / total_predict_time if total_predict_time > 0 else 0.0
                 total_time = total_fit_time + total_predict_time
@@ -266,7 +261,7 @@ class ForecastReporter(BaseForecaster):
                 print(f"    - Время прогноза (Predict Time):  {total_predict_time:.4f} сек")
                 print(f"    - Суммарное время (Total Time):   {total_time:.4f} сек")
                 print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_predict_time/len(test_years):.4f} сек/год)")
-                print(f"    - Метрики точности (1990-2020):   R² = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
+                print(f"    - Метрики точности (1990-2020):   R2 = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
 
                 self.summary_table.append({
                     'Блок': 'Валидация (1990-2020)',
@@ -277,7 +272,7 @@ class ForecastReporter(BaseForecaster):
                     'Predict Time (с)': round(total_predict_time, 4),
                     'Total Time (с)': round(total_time, 4),
                     'Скорость (зап/с)': round(speed_samples_sec, 2),
-                    'R²': round(r2, 4),
+                    'R2': round(r2, 4),
                     'MAE': round(mae, 4),
                     'RMSE': round(rmse, 4)
                 })
