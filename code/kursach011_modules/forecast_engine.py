@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import warnings
 
+from .meteo_data import load_monthly_meteo
 from .monthly_features import (
     create_forecast_features,
     create_time_features,
@@ -111,21 +112,7 @@ class BaseForecaster:
                 print(f"ОШИБКА: Не найдены файлы данных в {self.base_dir}/meteo_ru")
                 return pd.DataFrame()
 
-            cols = ['WMO', 'Year', 'Month', 'Day', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']
-            df = pd.read_csv(file_path, sep=r'\s+', names=cols, na_values=[-999.9])
-            df['DTR'] = df['Tmax'] - df['Tmin']
-            
-            coords = pd.read_csv(coords_path, sep=r'\s+')
-            lat_map = dict(zip(coords['WMO'], coords['Lat']))
-            lon_map = dict(zip(coords['WMO'], coords['Lon']))
-            
-            df['Latitude'] = df['WMO'].map(lat_map)
-            df['Longitude'] = df['WMO'].map(lon_map)
-            
-            df_monthly = df.groupby(['WMO', 'Year', 'Month', 'Latitude', 'Longitude']).agg(
-                DTR=('DTR', 'mean'), 
-                Precip=('Precip', 'sum')
-            ).reset_index()
+            df_monthly = load_monthly_meteo(file_path, coords_path)
             
         elif dataset_name == 'CRU_CEDA':
             file_path = self.base_dir / "cru ceda" / "cru_aligned_data.csv"

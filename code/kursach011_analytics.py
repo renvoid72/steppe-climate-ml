@@ -23,6 +23,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
+from kursach011_modules.meteo_data import load_monthly_meteo
+
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
@@ -205,21 +207,7 @@ def load_full_fact_data():
     coords_txt = PROJECT_DIR / "meteo_ru" / "stations_coords.txt"
     if meteo_txt.exists() and coords_txt.exists():
         print("   Загрузка фактических данных Метео РФ (1960-2024 гг.)...")
-        cols = ['WMO', 'Year', 'Month', 'Day', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']
-        df_meteo = pd.read_csv(meteo_txt, sep=r'\s+', names=cols, na_values=[-999.9])
-        df_meteo['DTR'] = df_meteo['Tmax'] - df_meteo['Tmin']
-
-        coords = pd.read_csv(coords_txt, sep=r'\s+')
-        lat_map = dict(zip(coords['WMO'], coords['Lat']))
-        lon_map = dict(zip(coords['WMO'], coords['Lon']))
-        df_meteo['Latitude'] = df_meteo['WMO'].map(lat_map)
-        df_meteo['Longitude'] = df_meteo['WMO'].map(lon_map)
-
-        # Помесячная агрегация по станциям
-        df_meteo_monthly = df_meteo.groupby(['WMO', 'Year', 'Month', 'Latitude', 'Longitude']).agg({
-            'DTR': 'mean',
-            'Precip': 'sum'
-        }).reset_index()
+        df_meteo_monthly = load_monthly_meteo(meteo_txt, coords_txt)
         df_meteo_monthly['Region'] = df_meteo_monthly['Longitude'].apply(get_macroregion)
         fact_datasets['METEO_RU'] = df_meteo_monthly
     else:

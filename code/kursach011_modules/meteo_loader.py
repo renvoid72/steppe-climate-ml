@@ -144,7 +144,7 @@ class SteppeClimateLoader:
                     'Tmin': df['tmin'].fillna(-999.9),
                     'Tavg': df['tavg'].fillna(-999.9),
                     'Tmax': df['tmax'].fillna(-999.9),
-                    'Precip': df['prcp'].fillna(0.0)
+                    'Precip': df['prcp']
                 }
                 
                 clean = pd.DataFrame(data_dict)
@@ -191,7 +191,7 @@ class SteppeClimateLoader:
         self.final_data = self.final_data.sort_values(by=['WMO', 'Year', 'Month', 'Day'])
         
         # Сохранение
-        self.final_data.to_csv(self.file_data, sep=' ', index=False, header=False)
+        self.final_data.to_csv(self.file_data, sep=' ', index=False, header=False, na_rep='-999.9')
         self.final_meta.to_csv(self.file_coords, sep=' ', index=False)
         
         # ПРОВЕРКА: Выводим первые 5 строк в консоль, чтобы ты увидел, что WMO на месте
