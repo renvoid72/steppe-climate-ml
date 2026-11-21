@@ -26,6 +26,8 @@ from shapely.geometry import mapping
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
+from kursach011_modules.meteo_data import load_monthly_meteo
+
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
@@ -83,21 +85,7 @@ def load_meteo_ru_monthly():
     if not meteo_file.exists() or not coords_file.exists():
         raise FileNotFoundError("Файлы данных METEO_RU не найдены в папке 'meteo_ru'.")
     
-    cols = ['WMO', 'Year', 'Month', 'Day', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']
-    df = pd.read_csv(meteo_file, sep=r'\s+', names=cols, na_values=[-999.9])
-    df['DTR'] = df['Tmax'] - df['Tmin']
-    
-    coords = pd.read_csv(coords_file, sep=r'\s+')
-    lat_map = dict(zip(coords['WMO'], coords['Lat']))
-    lon_map = dict(zip(coords['WMO'], coords['Lon']))
-    
-    df['Latitude'] = df['WMO'].map(lat_map)
-    df['Longitude'] = df['WMO'].map(lon_map)
-    
-    df_monthly = df.groupby(['WMO', 'Year', 'Month', 'Latitude', 'Longitude']).agg(
-        DTR=('DTR', 'mean'), 
-        Precip=('Precip', 'sum')
-    ).reset_index()
+    df_monthly = load_monthly_meteo(meteo_file, coords_file)
     
     df_monthly['Date'] = pd.to_datetime(df_monthly[['Year', 'Month']].assign(day=1))
     return df_monthly

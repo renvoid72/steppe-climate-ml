@@ -23,8 +23,10 @@ from pathlib import Path
 import random
 
 if __package__:
+    from .meteo_data import load_monthly_meteo
     from .monthly_features import create_forecast_features, model_feature_columns, select_model_rows
 else:
+    from meteo_data import load_monthly_meteo
     from monthly_features import create_forecast_features, model_feature_columns, select_model_rows
 
 warnings.filterwarnings('ignore')
@@ -70,21 +72,7 @@ def load_data_sampled(dataset_name):
     print(f"--- Загрузка и сэмплирование: {dataset_name} ---")
     
     if dataset_name == 'METEO_RU':
-        cols = ['WMO', 'Year', 'Month', 'Day', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']
-        df = pd.read_csv(METEO_DATA_FILE, sep=r'\s+', names=cols, na_values=[-999.9])
-        df['DTR'] = df['Tmax'] - df['Tmin']
-        
-        # Координаты нужны для группировки при сэмплировании
-        coords = pd.read_csv(COORDS_FILE, sep=r'\s+')
-        lat_map = dict(zip(coords['WMO'], coords['Lat']))
-        lon_map = dict(zip(coords['WMO'], coords['Lon']))
-        df['Latitude'] = df['WMO'].map(lat_map)
-        df['Longitude'] = df['WMO'].map(lon_map)
-        
-        # Агрегация до месяца
-        df_monthly = df.groupby(['WMO', 'Year', 'Month', 'Latitude', 'Longitude']).agg(
-            DTR=('DTR', 'mean'), Precip=('Precip', 'sum')
-        ).reset_index()
+        df_monthly = load_monthly_meteo(METEO_DATA_FILE, COORDS_FILE)
         
     elif dataset_name == 'CRU_CEDA':
         df_monthly = pd.read_csv(CRU_FILE)
