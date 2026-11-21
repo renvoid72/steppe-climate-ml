@@ -23,6 +23,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
+from kursach011_modules.aggregation import sum_with_gaps
+
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
@@ -218,7 +220,7 @@ def load_full_fact_data():
         # Помесячная агрегация по станциям
         df_meteo_monthly = df_meteo.groupby(['WMO', 'Year', 'Month', 'Latitude', 'Longitude']).agg({
             'DTR': 'mean',
-            'Precip': 'sum'
+            'Precip': sum_with_gaps
         }).reset_index()
         df_meteo_monthly['Region'] = df_meteo_monthly['Longitude'].apply(get_macroregion)
         fact_datasets['METEO_RU'] = df_meteo_monthly

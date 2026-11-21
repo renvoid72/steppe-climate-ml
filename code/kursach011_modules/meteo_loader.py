@@ -144,7 +144,7 @@ class SteppeClimateLoader:
                     'Tmin': df['tmin'].fillna(-999.9),
                     'Tavg': df['tavg'].fillna(-999.9),
                     'Tmax': df['tmax'].fillna(-999.9),
-                    'Precip': df['prcp'].fillna(0.0)
+                    'Precip': df['prcp'].fillna(-999.9)
                 }
                 
                 clean = pd.DataFrame(data_dict)
