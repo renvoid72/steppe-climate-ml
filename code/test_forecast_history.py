@@ -2,6 +2,7 @@
 import unittest
 from contextlib import redirect_stdout
 from io import BytesIO, TextIOWrapper
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -49,6 +50,44 @@ class ForecastHistoryTest(unittest.TestCase):
         self.assertEqual(select_model_rows(future).index.tolist(), ['A'])
         self.assertEqual(future.loc['A', 'Precip_lag_1'], 0.0)
         self.assertTrue(select_model_rows(future, 'DTR').empty)
+
+    def test_meteo_keeps_one_known_indicator_for_targets_and_lags(self):
+        base_dir = Path(self.output_dir)
+        meteo_dir = base_dir / 'meteo_ru'
+        meteo_dir.mkdir()
+        (meteo_dir / 'all_steppe_data.txt').touch()
+        (meteo_dir / 'stations_coords.txt').touch()
+        monthly = self.source.drop(columns='Date').copy()
+        january = monthly['Year'].eq(2024) & monthly['Month'].eq(1) & monthly['WMO'].eq('A')
+        monthly.loc[january, 'Precip'] = None
+        forecaster = StandardForecaster(base_dir, base_dir)
+
+        with patch('kursach011_modules.forecast_engine.load_monthly_meteo', return_value=monthly):
+            data = forecaster.load_data('METEO_RU')
+
+        features = forecaster.create_features(data)
+        targets = features.loc[features['Year'] == 2024]
+        self.assertEqual(select_model_rows(targets, 'DTR')['WMO'].tolist(), ['A'])
+        self.assertTrue(select_model_rows(targets, 'Precip').empty)
+
+        february = pd.Timestamp('2024-02-01')
+        forecast = create_forecast_features(data, february)
+        next_month = forecast.loc[forecast['Date'] == february].set_index('WMO').loc['A']
+        self.assertEqual(next_month['DTR_lag_1'], 10.0)
+        self.assertTrue(pd.isna(next_month['Precip_lag_1']))
+
+    def test_meteo_forecast_cache_requires_calendar_coverage(self):
+        forecaster = StandardForecaster(self.output_dir, self.output_dir)
+        filename = 'METEO_RU_DTR_2024.csv'
+        forecast = self.source.iloc[:1].assign(
+            Forecast=10.0, Fact=10.0, Model='K-Neighbors', Target_Var='DTR',
+            History_Policy='complete_features',
+        )
+        forecast.to_csv(forecaster.output_dir / filename, index=False)
+
+        self.assertFalse(forecaster._is_file_valid(filename, 'METEO_RU'))
+        forecaster._save_predictions([forecast], filename, 'METEO_RU')
+        self.assertTrue(forecaster._is_file_valid(filename, 'METEO_RU'))
 
     def test_standard_forecast_replaces_legacy_cache_and_preserves_missing_facts(self):
         forecaster = StandardForecaster(self.output_dir, self.output_dir)

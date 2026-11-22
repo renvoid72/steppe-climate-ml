@@ -136,7 +136,10 @@ class LSTMFORECASTENGINE:
 
         df_monthly['Date'] = pd.to_datetime(df_monthly[['Year', 'Month']].assign(day=1))
         df_monthly = df_monthly[df_monthly['Year'] >= 1960]
-        df_monthly = df_monthly.dropna(subset=['DTR', 'Precip', 'Latitude', 'Longitude'])
+        required_columns = ['Latitude', 'Longitude']
+        if dataset_name == 'CRU_CEDA':
+            required_columns.extend(['DTR', 'Precip'])
+        df_monthly = df_monthly.dropna(subset=required_columns)
         df_monthly = df_monthly.sort_values(by=['WMO', 'Date']).reset_index(drop=True)
         return df_monthly
 
@@ -148,7 +151,7 @@ class LSTMFORECASTENGINE:
         return df
 
     def _build_sequences(self, df, target_var):
-        """Формирует входные окна из непрерывных месяцев перед целевой датой."""
+        """Формирует полные входные окна из непрерывных месяцев с известной целью."""
         df = self._prepare_features_df(df.sort_values(['WMO', 'Date']))
         
         # Подготовка признаков: целевая + ко-переменная + календарь + координаты
@@ -196,7 +199,10 @@ class LSTMFORECASTENGINE:
             consecutive_months = np.diff(months_all[mask]) == 1
             steps = np.lib.stride_tricks.sliding_window_view(consecutive_months, self.lookback)
             for i in np.flatnonzero(steps.all(axis=1)) + self.lookback:
-                X_list.append(w_feats[i - self.lookback:i])
+                history = w_feats[i - self.lookback:i]
+                if not np.isfinite(w_targets[i]) or not np.isfinite(history).all():
+                    continue
+                X_list.append(history)
                 y_list.append(w_targets[i])
                 date_list.append(w_dates[i])
                 wmo_list.append(w)

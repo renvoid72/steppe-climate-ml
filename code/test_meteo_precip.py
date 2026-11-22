@@ -62,36 +62,48 @@ class MeteoPrecipitationTest(unittest.TestCase):
                 '27995 2000 5 1 0 -999.9 0.0 -999.9 -999.9',
             ],
         )
-        with patch('kursach011_eof.PROJECT_DIR', self.base_dir):
-            monthly = load_meteo_ru_monthly().set_index('Month')
-
-        self.assertEqual(monthly.loc[1, 'Precip'], 0.0)
-        self.assertTrue(pd.isna(monthly.loc[1, 'DTR']))
-        self.assertEqual(monthly.loc[2, 'DTR'], 5.0)
-        self.assertTrue(pd.isna(monthly.loc[2, 'Precip']))
-        self.assertEqual(monthly.loc[3, 'DTR'], 8.0)
-        self.assertEqual(monthly.loc[3, 'Precip'], 2.5)
-
-    def test_monthly_totals_keep_missing_precipitation(self):
-        self.loader.file_data.write_text(
-            '27995 2000 1 1 0 -2.0 0.0 2.0 0.0\n'
-            '27995 2000 1 2 0 -2.0 0.0 2.0 0.0\n'
-            '27995 2000 2 1 0 -2.0 0.0 2.0 -999.9\n'
-            '27995 2000 3 1 0 -2.0 0.0 2.0 0.0\n'
-            '27995 2000 3 2 0 -2.0 0.0 2.0 -999.9\n'
-            '27995 2000 4 1 0 -2.0 0.0 2.0 1.5\n'
-            '27995 2000 4 2 0 -2.0 0.0 2.0 2.5\n',
-            encoding='utf-8',
-        )
-        self.loader.file_coords.write_text(
-            'WMO Name Lat Lon\n27995 Station 52.0 49.0\n', encoding='utf-8'
-        )
+    def test_monthly_precipitation_requires_all_calendar_days(self):
+        dates = pd.date_range('2000-01-01', periods=3651, name='time')
+        daily = pd.DataFrame(
+            {'tmin': -2.0, 'tavg': 0.0, 'tmax': 2.0, 'prcp': 0.0},
+            index=dates,
+        ).drop(pd.Timestamp('2000-02-29'))
+        daily.loc['2000-03-02', 'prcp'] = None
+        daily.loc['2000-04-01':'2000-04-02', 'prcp'] = [1.5, 2.5]
+        daily.loc['2000-05', 'prcp'] = None
+        daily.loc['2004-02-29', 'prcp'] = 3.0
+        self.export_daily(daily)
 
         with patch('kursach011_eof.PROJECT_DIR', self.base_dir):
-            monthly = load_meteo_ru_monthly().set_index('Month')
+            monthly = load_meteo_ru_monthly().set_index(['Year', 'Month'])
 
-        self.assertEqual(monthly.loc[1, 'Precip'], 0.0)
-        self.assertTrue(pd.isna(monthly.loc[2, 'Precip']))
-        self.assertTrue(pd.isna(monthly.loc[3, 'Precip']))
-        self.assertEqual(monthly.loc[4, 'Precip'], 4.0)
-        self.assertEqual(monthly['DTR'].tolist(), [4.0] * 4)
+        self.assertEqual(monthly.loc[(2000, 1), 'Precip'], 0.0)
+        self.assertTrue(pd.isna(monthly.loc[(2000, 2), 'Precip']))
+        self.assertEqual(monthly.loc[(2000, 2), 'DTR'], 4.0)
+        self.assertTrue(pd.isna(monthly.loc[(2000, 3), 'Precip']))
+        self.assertEqual(monthly.loc[(2000, 4), 'Precip'], 4.0)
+        self.assertTrue(pd.isna(monthly.loc[(2000, 5), 'Precip']))
+        self.assertEqual(monthly.loc[(2004, 2), 'Precip'], 3.0)
+
+    def test_monthly_dtr_limits_total_and_consecutive_gaps(self):
+        dates = pd.date_range('2000-01-01', periods=3654, name='time')
+        daily = pd.DataFrame(
+            {'tmin': -2.0, 'tavg': 0.0, 'tmax': 2.0, 'prcp': 0.0},
+            index=dates,
+        )
+        daily.loc['2000-01-01':'2000-01-03', 'tmin'] = None
+        daily.loc[['2000-01-15', '2000-01-31'], 'tmax'] = None
+        daily.loc['2000-01-15', 'prcp'] = None
+        daily.loc[[f'2000-02-{day:02}' for day in (2, 6, 10, 14, 18, 22)], 'tmin'] = None
+        daily.loc['2000-03-28':'2000-03-31', 'tmin'] = None
+        daily = daily.drop(pd.date_range('2000-04-10', '2000-04-13'))
+        self.export_daily(daily)
+
+        with patch('kursach011_eof.PROJECT_DIR', self.base_dir):
+            monthly = load_meteo_ru_monthly().set_index(['Year', 'Month']).loc[2000]
+
+        self.assertEqual(monthly.loc[1, 'DTR'], 4.0)
+        self.assertTrue(pd.isna(monthly.loc[1, 'Precip']))
+        self.assertTrue(monthly.loc[[2, 3, 4], 'DTR'].isna().all())
+        self.assertEqual(monthly.loc[2, 'Precip'], 0.0)
+        self.assertEqual(monthly.loc[3, 'Precip'], 0.0)

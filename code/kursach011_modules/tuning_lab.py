@@ -81,7 +81,10 @@ def load_data_sampled(dataset_name):
     
     # === ОБРЕЗКА ПО ВРЕМЕНИ ===
     df_monthly = df_monthly[df_monthly['Year'] >= 1960]
-    df_monthly = df_monthly.dropna(subset=['DTR', 'Precip', 'Latitude', 'Longitude'])
+    required_columns = ['Latitude', 'Longitude']
+    if dataset_name == 'CRU_CEDA':
+        required_columns.extend(['DTR', 'Precip'])
+    df_monthly = df_monthly.dropna(subset=required_columns)
 
     # === СЭМПЛИРОВАНИЕ (Берем 25% станций) ===
     all_stations = df_monthly['WMO'].unique()

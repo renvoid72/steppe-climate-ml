@@ -140,6 +140,23 @@ class LSTMCalendarWindowsTest(unittest.TestCase):
                         windows[is_target, :, :2], [expected[columns].to_numpy()]
                     )
 
+    def test_lstm_requires_only_the_selected_target_and_complete_history(self):
+        gap_date = pd.Timestamp('2024-01-01')
+        data = self.source.loc[self.source['WMO'] == 'B'].copy()
+        data.loc[data['Date'] == gap_date, 'Precip'] = None
+
+        for target, expected_dates in [
+            ('DTR', ['2024-01-01', '2025-02-01', '2025-03-01', '2025-04-01']),
+            ('Precip', ['2025-02-01', '2025-03-01', '2025-04-01']),
+        ]:
+            with self.subTest(target=target):
+                windows, values, dates, _, _, _ = self.engine._build_sequences(data, target)
+                pd.testing.assert_index_equal(
+                    pd.DatetimeIndex(dates), pd.DatetimeIndex(expected_dates)
+                )
+                self.assertTrue(np.isfinite(windows).all())
+                self.assertTrue(np.isfinite(values).all())
+
     def test_lstm_keeps_tensor_and_date_types_when_all_windows_cross_a_gap(self):
         sparse = self.source.loc[
             (self.source['WMO'] == 'A') & self.source['Date'].between('2023-03-01', '2025-02-01')
