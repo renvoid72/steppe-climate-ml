@@ -131,7 +131,9 @@ class SteppeClimateLoader:
                     print("Мало данных -> Skip")
                     continue
                 
-                df = df.reset_index()
+                has_dtr = df['tmin'].notna() & df['tmax'].notna()
+                usable_days = df['tavg'].notna() | df['prcp'].notna() | has_dtr
+                df = df.loc[usable_days].reset_index()
                 
                 # ===> ИСПРАВЛЕНИЕ: Создаем через словарь <===
                 # Это гарантирует, что WMO растянется на все строки
@@ -148,9 +150,6 @@ class SteppeClimateLoader:
                 }
                 
                 clean = pd.DataFrame(data_dict)
-                
-                # Чистка
-                clean = clean[clean['Tavg'] != -999.9]
                 
                 # Округление
                 cols_round = ['Tmin', 'Tavg', 'Tmax', 'Precip']
