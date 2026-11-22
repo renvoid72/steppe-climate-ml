@@ -21,7 +21,10 @@ from .monthly_features import (
 warnings.filterwarnings('ignore')
 
 FORECAST_COLUMNS = ['Date', 'WMO', 'Latitude', 'Longitude', 'Forecast', 'Fact', 'Model', 'Target_Var']
-HISTORY_POLICY = 'complete_features'
+HISTORY_POLICIES = {
+    'METEO_RU': 'complete_features_calendar_coverage',
+    'CRU_CEDA': 'complete_features',
+}
 
 # Параметры (Regression Only)
 BEST_PARAMS = {
@@ -68,7 +71,7 @@ class BaseForecaster:
         }
         print(f"[{self.__class__.__name__}] Инициализирован. Папка: {self.output_dir}")
 
-    def _is_file_valid(self, filename):
+    def _is_file_valid(self, filename, dataset_name):
         """Проверяет, сохранены ли прогнозы с действующим правилом отбора строк."""
         try:
             df = pd.read_csv(self.output_dir / filename, nrows=1)
@@ -79,12 +82,12 @@ class BaseForecaster:
             not df.empty
             and set(FORECAST_COLUMNS).issubset(df.columns)
             and 'History_Policy' in df.columns
-            and df['History_Policy'].iat[0] == HISTORY_POLICY
+            and df['History_Policy'].iat[0] == HISTORY_POLICIES[dataset_name]
         )
 
-    def _save_predictions(self, predictions, filename):
+    def _save_predictions(self, predictions, filename, dataset_name):
         df = pd.concat(predictions) if predictions else pd.DataFrame(columns=FORECAST_COLUMNS)
-        df['History_Policy'] = HISTORY_POLICY
+        df['History_Policy'] = HISTORY_POLICIES[dataset_name]
         with TemporaryDirectory(dir=self.output_dir) as temp_dir:
             temp_file = Path(temp_dir) / filename
             df.to_csv(temp_file, index=False)
@@ -128,7 +131,10 @@ class BaseForecaster:
         # Обрезка с 1960 года для корректности
         df_monthly = df_monthly[df_monthly['Year'] >= 1960]
         
-        df_monthly = df_monthly.dropna(subset=['DTR', 'Precip', 'Latitude', 'Longitude'])
+        required_columns = ['Latitude', 'Longitude']
+        if dataset_name == 'CRU_CEDA':
+            required_columns.extend(['DTR', 'Precip'])
+        df_monthly = df_monthly.dropna(subset=required_columns)
         
         print(f"    Загружено {len(df_monthly)} записей.")
         return df_monthly
@@ -171,7 +177,7 @@ class StandardForecaster(BaseForecaster):
             fname = f"{dataset_name}_{target_var}_{target_year}.csv"
             
             # ПРОВЕРКА ФАЙЛА
-            if self._is_file_valid(fname):
+            if self._is_file_valid(fname, dataset_name):
                 print(f"  [SKIP] Файл {fname} уже существует и корректен.")
                 continue
 
@@ -241,7 +247,7 @@ class StandardForecaster(BaseForecaster):
                 mae = mean_absolute_error(monthly['Fact'], monthly['Forecast'])
                 print(f"    R2={r2:.4f}, MAE={mae:.4f}")
             
-            self._save_predictions(all_predictions, fname)
+            self._save_predictions(all_predictions, fname, dataset_name)
             print(f"  -> Сохранено: {fname}")
 
 # ============================================================================
@@ -270,7 +276,7 @@ class LongTermValidator(BaseForecaster):
             
             # ПРОВЕРКА ФАЙЛА
             fname = f"Validation_{dataset_name}_{target_var}_{split_year}-{final_year}.csv"
-            if self._is_file_valid(fname):
+            if self._is_file_valid(fname, dataset_name):
                 print(f"  [SKIP] Файл {fname} уже существует и корректен.")
                 continue
 
@@ -324,5 +330,5 @@ class LongTermValidator(BaseForecaster):
                 else:
                     print("      Нет данных.")
 
-            self._save_predictions(all_predictions, fname)
+            self._save_predictions(all_predictions, fname, dataset_name)
             print(f"  -> Результаты валидации сохранены в {fname}")
