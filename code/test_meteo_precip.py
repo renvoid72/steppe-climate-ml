@@ -18,6 +18,9 @@ class MeteoPrecipitationTest(unittest.TestCase):
         self.enterContext(redirect_stdout(StringIO()))
 
     def export_daily(self, daily):
+        for flag in ('tmin_flag', 'tavg_flag', 'tmax_flag', 'prcp_flag'):
+            if flag not in daily.columns:
+                daily = daily.assign(**{flag: pd.NA})
         self.loader.target_stations = pd.DataFrame(
             {'name': ['Station'], 'latitude': [52.0], 'longitude': [49.0]},
             index=['27995'],
@@ -25,7 +28,47 @@ class MeteoPrecipitationTest(unittest.TestCase):
         with patch('kursach011_modules.meteo_loader.Daily') as daily_source:
             daily_source.return_value.fetch.return_value = daily
             self.loader.step_3_download_data()
+            daily_source.assert_called_once_with(
+                '27995', self.loader.start, self.loader.end, model=True, flags=True
+            )
         self.loader.step_4_save()
+
+    def test_daily_source_flags_and_yearly_shares(self):
+        dates = pd.date_range('2000-01-01', periods=3650, name='time')
+        daily = pd.DataFrame(
+            {
+                'tmin': -2.0, 'tavg': 0.0, 'tmax': 2.0, 'prcp': 0.0,
+                'tmin_flag': 'B', 'tavg_flag': 'E', 'tmax_flag': 'B', 'prcp_flag': 'B',
+            },
+            index=dates,
+        )
+        daily.loc['2000-01-01', ['tmin_flag', 'prcp_flag']] = ['BG', 'G']
+        daily.loc['2000-01-02', ['tmin_flag', 'prcp_flag']] = None
+        daily.loc['2000-01-03', ['tmin', 'prcp']] = None
+        daily.loc['2000-01-03', ['tmax_flag', 'prcp_flag']] = 'G'
+        self.export_daily(daily.iloc[::-1])
+
+        flags = pd.read_csv(self.loader.out_dir / 'daily_sources.csv')
+        observations = pd.read_csv(
+            self.loader.file_data, sep=r'\s+', header=None, usecols=[0, 1, 2, 3],
+            names=['WMO', 'Year', 'Month', 'Day'],
+        )
+        self.assertEqual(flags['WMO'].tolist(), observations['WMO'].tolist())
+        self.assertEqual(
+            flags['Date'].tolist(),
+            pd.to_datetime(observations[['Year', 'Month', 'Day']]).dt.strftime('%Y-%m-%d').tolist(),
+        )
+        self.assertEqual(flags.loc[0, ['tmin_flag', 'tavg_flag', 'tmax_flag', 'prcp_flag']].tolist(),
+                         ['BG', 'E', 'B', 'G'])
+        self.assertTrue(flags.loc[1, ['tmin_flag', 'prcp_flag']].isna().all())
+
+        summary = pd.read_csv(self.loader.out_dir / 'daily_source_summary.csv').set_index(['Year', 'Variable'])
+        for variable in ('DTR', 'Precip'):
+            with self.subTest(variable=variable):
+                year = summary.loc[(2000, variable)]
+                self.assertEqual(year[['Available', 'Observed', 'Modeled', 'Unknown']].tolist(),
+                                 [365, 363, 1, 1])
+                self.assertAlmostEqual(year['ModeledSharePct'], 100 / 365)
 
     def test_daily_export_distinguishes_zero_from_missing_precipitation(self):
         dates = pd.date_range('2000-01-01', periods=3650, name='time')
@@ -62,6 +105,7 @@ class MeteoPrecipitationTest(unittest.TestCase):
                 '27995 2000 5 1 0 -999.9 0.0 -999.9 -999.9',
             ],
         )
+
     def test_monthly_precipitation_requires_all_calendar_days(self):
         dates = pd.date_range('2000-01-01', periods=3651, name='time')
         daily = pd.DataFrame(

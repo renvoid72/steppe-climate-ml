@@ -18,12 +18,47 @@ from meteostat import Stations, Daily
 from shapely.geometry import Point
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import warnings
 import os
 import matplotlib.pyplot as plt
 import time 
 
 warnings.filterwarnings('ignore')
+
+SOURCE_FLAGS = ['tmin_flag', 'tavg_flag', 'tmax_flag', 'prcp_flag']
+
+
+def summarize_daily_sources(daily):
+    """Считает происхождение доступных суточных значений по годам."""
+    temperatures = daily[['Tmin', 'Tmax']]
+    has_dtr = (temperatures.notna() & temperatures.ne(-999.9)).all(axis=1)
+    indicators = [
+        ('DTR', has_dtr, ['tmin_flag', 'tmax_flag']),
+        ('Precip', daily['Precip'].notna(), ['prcp_flag']),
+    ]
+
+    summaries = []
+    for variable, available, columns in indicators:
+        flags = daily[columns].astype('string')
+        modeled = available & flags.apply(
+            lambda flag: flag.str.contains('G', regex=False, na=False)
+        ).any(axis=1)
+        observed = available & flags.apply(
+            lambda flag: flag.str.fullmatch('[A-F]+', na=False)
+        ).all(axis=1)
+        counts = pd.DataFrame({
+            'Year': daily['Year'],
+            'Available': available,
+            'Observed': observed,
+            'Modeled': modeled,
+            'Unknown': available & ~(modeled | observed),
+        }).groupby('Year', as_index=False).sum()
+        counts.insert(1, 'Variable', variable)
+        counts['ModeledSharePct'] = 100 * counts['Modeled'] / counts['Available']
+        summaries.append(counts)
+    return pd.concat(summaries, ignore_index=True).sort_values(['Year', 'Variable'])
+
 
 class SteppeClimateLoader:
     def __init__(self, base_dir):
@@ -43,6 +78,8 @@ class SteppeClimateLoader:
         
         self.file_data = self.out_dir / "all_steppe_data.txt"      
         self.file_coords = self.out_dir / "stations_coords.txt"    
+        self.file_sources = self.out_dir / "daily_sources.csv"
+        self.file_source_summary = self.out_dir / "daily_source_summary.csv"
         self.file_map_png = self.out_dir / "stations_final_map.png"
         self.file_map_tiff = self.out_dir / "stations_final_map.tif"
 
@@ -112,7 +149,7 @@ class SteppeClimateLoader:
 
             for attempt in range(MAX_RETRIES):
                 try:
-                    data = Daily(wmo_id, self.start, self.end)
+                    data = Daily(wmo_id, self.start, self.end, model=True, flags=True)
                     df = data.fetch()
                     download_success = True
                     break 
@@ -146,7 +183,8 @@ class SteppeClimateLoader:
                     'Tmin': df['tmin'].fillna(-999.9),
                     'Tavg': df['tavg'].fillna(-999.9),
                     'Tmax': df['tmax'].fillna(-999.9),
-                    'Precip': df['prcp']
+                    'Precip': df['prcp'],
+                    **{flag: df[flag] for flag in SOURCE_FLAGS},
                 }
                 
                 clean = pd.DataFrame(data_dict)
@@ -173,7 +211,7 @@ class SteppeClimateLoader:
             except Exception as e:
                 print(f"Ошибка обработки: {e}")
                 
-        self.final_data = pd.concat(all_dfs) if all_dfs else pd.DataFrame()
+        self.final_data = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
         self.final_meta = pd.DataFrame(valid_meta)
 
     def step_4_save(self):
@@ -183,23 +221,46 @@ class SteppeClimateLoader:
             print("ОШИБКА: Нет данных для сохранения.")
             return
 
-        # Гарантируем порядок колонок
-        cols_order = ['WMO', 'Year', 'Month', 'Day', 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']
-        self.final_data = self.final_data[cols_order]
-        
-        self.final_data = self.final_data.sort_values(by=['WMO', 'Year', 'Month', 'Day'])
-        
-        # Сохранение
-        self.final_data.to_csv(self.file_data, sep=' ', index=False, header=False, na_rep='-999.9')
-        self.final_meta.to_csv(self.file_coords, sep=' ', index=False)
+        date_columns = ['Year', 'Month', 'Day']
+        keys = ['WMO', *date_columns]
+        cols_order = [*keys, 'Quality', 'Tmin', 'Tavg', 'Tmax', 'Precip']
+        self.final_data = self.final_data.sort_values(keys)
+        if self.final_data.duplicated(keys).any():
+            raise ValueError('Для выгрузки нужны уникальные суточные строки по станции и дате')
+
+        sources = self.final_data[['WMO', *SOURCE_FLAGS]].copy()
+        sources.insert(1, 'Date', pd.to_datetime(self.final_data[date_columns]))
+        summary = summarize_daily_sources(self.final_data)
+        with TemporaryDirectory(dir=self.out_dir) as scratch:
+            staging = Path(scratch)
+            self.final_data[cols_order].to_csv(
+                staging / self.file_data.name, sep=' ', index=False, header=False, na_rep='-999.9'
+            )
+            self.final_meta.to_csv(staging / self.file_coords.name, sep=' ', index=False)
+            sources.to_csv(staging / self.file_sources.name, index=False, date_format='%Y-%m-%d')
+            summary.to_csv(staging / self.file_source_summary.name, index=False)
+
+            # Старая сводка и флаги относятся к предыдущему TXT.
+            self.file_source_summary.unlink(missing_ok=True)
+            self.file_sources.unlink(missing_ok=True)
+            for path in (self.file_data, self.file_coords, self.file_sources, self.file_source_summary):
+                (staging / path.name).replace(path)
         
         # ПРОВЕРКА: Выводим первые 5 строк в консоль, чтобы ты увидел, что WMO на месте
         print("\n--- ПРОВЕРКА (Первые 5 строк) ---")
-        print(self.final_data.head().to_string(index=False, header=False))
+        print(self.final_data.head()[cols_order].to_string(index=False, header=False))
         print("---------------------------------\n")
         
         print(f"  -> Данные сохранены: {self.file_data}")
         print(f"  -> Координаты сохранены: {self.file_coords}")
+        print(f"  -> Флаги источников: {self.file_sources}")
+        print(f"  -> Годовая сводка источников: {self.file_source_summary}")
+        totals = summary.groupby('Variable')[['Modeled', 'Available', 'Unknown']].sum()
+        for variable, row in totals.iterrows():
+            if row.Available:
+                share = 100 * row.Modeled / row.Available
+                print(f"  -> {variable}: по флагу G {row.Modeled}/{row.Available} ({share:.2f}%), "
+                      f"источник неизвестен для {row.Unknown}")
         print(f"  -> Всего записей: {len(self.final_data)}")
         print(f"  -> Всего станций: {len(self.final_meta)}")
 
