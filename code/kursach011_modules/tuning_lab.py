@@ -7,7 +7,7 @@
 1.  ИСКЛЮЧИТЕЛЬНО РЕГРЕССИЯ: Классификатор убран полностью.
 2.  УНИВЕРСАЛЬНЫЕ СЕТКИ: Одни и те же диапазоны параметров для всех задач.
 3.  БЫСТРОДЕЙСТВИЕ: Используется 25% станций для ускорения.
-4.  WALK-FORWARD: Валидация на 3 годах (2021-2023 для Метео, 2017-2019 для CRU).
+4.  WALK-FORWARD: Валидация на трёх годах до общего года оценки.
 """
 import pandas as pd
 import numpy as np
@@ -25,9 +25,11 @@ import random
 if __package__:
     from .meteo_data import load_monthly_meteo
     from .monthly_features import create_forecast_features, model_feature_columns, select_model_rows
+    from .project_settings import ANALYSIS_YEAR, cru_csv_path
 else:
     from meteo_data import load_monthly_meteo
     from monthly_features import create_forecast_features, model_feature_columns, select_model_rows
+    from project_settings import ANALYSIS_YEAR, cru_csv_path
 
 warnings.filterwarnings('ignore')
 
@@ -37,7 +39,7 @@ warnings.filterwarnings('ignore')
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 METEO_DATA_FILE = BASE_DIR / "meteo_ru" / "all_steppe_data.txt"
 COORDS_FILE = BASE_DIR / "meteo_ru" / "stations_coords.txt"
-CRU_FILE = BASE_DIR / "cru ceda" / "cru_aligned_data.csv"
+CRU_FILE = cru_csv_path(BASE_DIR)
 
 # Ускорение: берем только 25% станций
 STATION_FRACTION = 0.45
@@ -196,14 +198,13 @@ if __name__ == "__main__":
     print("ЗАПУСК БЫСТРОГО ПОДБОРА (REGR ONLY, UNIVERSAL GRIDS)")
     
     # 1. МЕТЕО.РУ (3 года тест)
-    test_years_meteo = [2021, 2022, 2023]
+    test_years = list(range(ANALYSIS_YEAR - 3, ANALYSIS_YEAR))
     
     # Если хочешь перепроверить DTR - раскомментируй
-    # tune_model('METEO_RU', 'DTR', test_years_meteo)
-    tune_model('METEO_RU', 'Precip', test_years_meteo)
+    # tune_model('METEO_RU', 'DTR', test_years)
+    tune_model('METEO_RU', 'Precip', test_years)
     
     # 2. CRU CEDA (3 года тест)
-    test_years_cru = [2017, 2018, 2019]
     
-    # tune_model('CRU_CEDA', 'DTR', test_years_cru)
-    tune_model('CRU_CEDA', 'Precip', test_years_cru)
+    # tune_model('CRU_CEDA', 'DTR', test_years)
+    tune_model('CRU_CEDA', 'Precip', test_years)

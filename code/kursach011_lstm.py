@@ -22,6 +22,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
+from kursach011_modules.forecast_engine import mark_prediction_source
+from kursach011_modules.project_settings import (
+    ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR,
+    cru_csv_path, forecast_filename, results_dir, validation_filename,
+)
+from prepare_cru import ensure_cru_csv
+
 warnings.filterwarnings('ignore')
 
 # --- СИСТЕМНЫЕ ПУТИ ---
@@ -29,7 +36,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 CODE_DIR = PROJECT_DIR / "code"
 MODULES_DIR = CODE_DIR / "kursach011_modules"
 
-RESULTS_DIR = PROJECT_DIR / "output011_modules" / "lstm"
+RESULTS_DIR = results_dir(PROJECT_DIR) / "lstm"
 STD_CSV_DIR = RESULTS_DIR / "standard_forecast" / "csv_data"
 VAL_CSV_DIR = RESULTS_DIR / "validation_results" / "csv_data"
 REPORT_FILE = RESULTS_DIR / "forecast_report.txt"
@@ -43,7 +50,6 @@ for p in [str(CODE_DIR), str(MODULES_DIR), str(PROJECT_DIR)]:
 
 from kursach011_modules.meteo_data import load_monthly_meteo
 from kursach011_modules.meteo_loader import SteppeClimateLoader
-from kursach011_modules.cru_loader import CruDataLoader
 
 
 # ==============================================================================
@@ -126,7 +132,7 @@ class LSTMFORECASTENGINE:
             df_monthly = load_monthly_meteo(file_path, coords_path)
             
         elif dataset_name == 'CRU_CEDA':
-            file_path = self.base_dir / "cru ceda" / "cru_aligned_data.csv"
+            file_path = cru_csv_path(self.base_dir)
             if not file_path.exists():
                 print(f"  ОШИБКА: Не найден файл {file_path}")
                 return pd.DataFrame()
@@ -300,7 +306,7 @@ class LSTMFORECASTENGINE:
 
         STD_CSV_DIR.mkdir(parents=True, exist_ok=True)
         for target_var in ['DTR', 'Precip']:
-            fname = f"{dataset_name}_{target_var}_{target_year}.csv"
+            fname = forecast_filename(dataset_name, target_var, target_year)
             print(f"\n---> Параметр: {target_var} <---")
             print(f"\n  * Модель: LSTM Neural Network")
 
@@ -380,6 +386,7 @@ class LSTMFORECASTENGINE:
 
             # Сохранение CSV
             df_out = pd.DataFrame(all_res_rows, columns=FORECAST_COLUMNS)
+            mark_prediction_source(df_out, dataset_name)
             df_out.to_csv(STD_CSV_DIR / fname, index=False)
 
             self.summary_table.append({
@@ -397,9 +404,9 @@ class LSTMFORECASTENGINE:
             })
 
     # ==========================================================================
-    # 2. ДОЛГОСРОЧНАЯ ВАЛИДАЦИЯ (1990-2020 BACKTESTING)
+    # 2. ДОЛГОСРОЧНАЯ ВАЛИДАЦИЯ
     # ==========================================================================
-    def run_validation(self, split_year, dataset_name, end_year=2020):
+    def run_validation(self, split_year, dataset_name, end_year=VALIDATION_END_YEAR):
         print("\n" + "="*80)
         print(f" БЛОК 2: ДОЛГОСРОЧНАЯ ВАЛИДАЦИЯ ({dataset_name} | Период: {split_year}-{end_year})")
         print("="*80)
@@ -418,7 +425,7 @@ class LSTMFORECASTENGINE:
 
         VAL_CSV_DIR.mkdir(parents=True, exist_ok=True)
         for target_var in ['DTR', 'Precip']:
-            fname = f"Validation_{dataset_name}_{target_var}_{split_year}-{final_year}.csv"
+            fname = validation_filename(dataset_name, target_var, split_year, final_year)
             print(f"\n---> Параметр: {target_var} <---")
             print(f"\n  * Модель: LSTM Neural Network")
 
@@ -502,6 +509,7 @@ class LSTMFORECASTENGINE:
 
             # Сохранение CSV
             df_out = pd.DataFrame(all_res_rows, columns=FORECAST_COLUMNS)
+            mark_prediction_source(df_out, dataset_name)
             df_out.to_csv(VAL_CSV_DIR / fname, index=False)
 
             self.summary_table.append({
@@ -558,20 +566,18 @@ def main():
     if not meteo_file.exists():
         SteppeClimateLoader(PROJECT_DIR).run()
 
-    cru_file = PROJECT_DIR / "cru ceda" / "cru_aligned_data.csv"
-    if not cru_file.exists():
-        CruDataLoader(PROJECT_DIR).run()
+    ensure_cru_csv(PROJECT_DIR)
 
     # 2. Инициализация движка
     engine = LSTMFORECASTENGINE(base_dir=PROJECT_DIR, lookback_window=12)
 
     # 3. Стандартный прогноз на 1 год
-    engine.run_standard_forecast(target_year=2024, dataset_name='METEO_RU')
-    engine.run_standard_forecast(target_year=2020, dataset_name='CRU_CEDA')
+    engine.run_standard_forecast(target_year=ANALYSIS_YEAR, dataset_name='METEO_RU')
+    engine.run_standard_forecast(target_year=ANALYSIS_YEAR, dataset_name='CRU_CEDA')
 
-    # 4. Долгосрочная валидация 1990-2020
-    engine.run_validation(split_year=1990, dataset_name='METEO_RU', end_year=2020)
-    engine.run_validation(split_year=1990, dataset_name='CRU_CEDA', end_year=2020)
+    # 4. Долгосрочная валидация
+    engine.run_validation(split_year=VALIDATION_START_YEAR, dataset_name='METEO_RU', end_year=VALIDATION_END_YEAR)
+    engine.run_validation(split_year=VALIDATION_START_YEAR, dataset_name='CRU_CEDA', end_year=VALIDATION_END_YEAR)
 
     # 5. Итоговая сводка
     engine.print_final_summary()

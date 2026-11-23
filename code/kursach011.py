@@ -6,12 +6,13 @@ current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir))
 
 from kursach011_modules.meteo_loader import SteppeClimateLoader
-from kursach011_modules.cru_loader import CruDataLoader
 from kursach011_modules.forecast_engine import StandardForecaster, LongTermValidator
+from kursach011_modules.project_settings import ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, results_dir
 from kursach011_modules.visualizer import StandardForecastVisualizer, ValidationVisualizer
+from prepare_cru import ensure_cru_csv
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-RESULTS_DIR = PROJECT_DIR / "output011_modules"
+RESULTS_DIR = results_dir(PROJECT_DIR)
 
 def main():
     print("\n>>> СТАРТ ИНФОРМАЦИОННОЙ СИСТЕМЫ <<<\n")
@@ -21,9 +22,7 @@ def main():
     if not meteo_file.exists():
         SteppeClimateLoader(PROJECT_DIR).run()
     
-    cru_file = Path(PROJECT_DIR) / "cru ceda" / "cru_aligned_data.csv"
-    if not cru_file.exists():
-        CruDataLoader(PROJECT_DIR).run()
+    ensure_cru_csv(PROJECT_DIR)
     
     # 2. ПРОГНОЗЫ
     print("\n" + "="*60)
@@ -32,13 +31,13 @@ def main():
     
     # Standard Forecast
     forecaster = StandardForecaster(base_dir=PROJECT_DIR, root_output_dir=RESULTS_DIR)
-    forecaster.run(target_year=2024, dataset_name='METEO_RU')
-    forecaster.run(target_year=2020, dataset_name='CRU_CEDA')
+    forecaster.run(target_year=ANALYSIS_YEAR, dataset_name='METEO_RU')
+    forecaster.run(target_year=ANALYSIS_YEAR, dataset_name='CRU_CEDA')
     
     # Validation
     validator = LongTermValidator(base_dir=PROJECT_DIR, root_output_dir=RESULTS_DIR)
-    validator.run(split_year=1990, dataset_name='METEO_RU', end_year=2020)
-    validator.run(split_year=1990, dataset_name='CRU_CEDA', end_year=2020)
+    validator.run(split_year=VALIDATION_START_YEAR, dataset_name='METEO_RU', end_year=VALIDATION_END_YEAR)
+    validator.run(split_year=VALIDATION_START_YEAR, dataset_name='CRU_CEDA', end_year=VALIDATION_END_YEAR)
     
     # 3. ВИЗУАЛИЗАЦИЯ
     print("\n" + "="*60)

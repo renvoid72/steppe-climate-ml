@@ -20,11 +20,14 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+from kursach011_modules.project_settings import VALIDATION_PERIOD, results_dir, validation_filename
+from kursach011_modules.forecast_engine import read_prediction_csv
+
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-RESULTS_DIR = PROJECT_DIR / "output011_modules"
+RESULTS_DIR = results_dir(PROJECT_DIR)
 CORR_DIR = RESULTS_DIR / "cross_correlation_analysis"
 
 # Добавляем путь к коду в sys.path, чтобы импортировать BaseVisualizer
@@ -91,16 +94,16 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
 
     def load_and_merge_data(self):
         """Загружает CSV долгосрочной валидации и объединяет их по ['Date', 'WMO', 'Model', 'Target_Var']."""
-        print("\n2. Загрузка и объединение данных валидации за 1990-2020 гг...")
+        print(f"\n2. Загрузка и объединение данных валидации за {VALIDATION_PERIOD} гг...")
         
         csv_configs = {
             'DTR': {
-                'meteo': self.results_dir / 'validation_results' / 'csv_data' / 'Validation_METEO_RU_DTR_1990-2020.csv',
-                'cru': self.results_dir / 'validation_results' / 'csv_data' / 'Validation_CRU_CEDA_DTR_1990-2020.csv'
+                'meteo': self.results_dir / 'validation_results' / 'csv_data' / validation_filename('METEO_RU', 'DTR'),
+                'cru': self.results_dir / 'validation_results' / 'csv_data' / validation_filename('CRU_CEDA', 'DTR')
             },
             'Precip': {
-                'meteo': self.results_dir / 'validation_results' / 'csv_data' / 'Validation_METEO_RU_Precip_1990-2020.csv',
-                'cru': self.results_dir / 'validation_results' / 'csv_data' / 'Validation_CRU_CEDA_Precip_1990-2020.csv'
+                'meteo': self.results_dir / 'validation_results' / 'csv_data' / validation_filename('METEO_RU', 'Precip'),
+                'cru': self.results_dir / 'validation_results' / 'csv_data' / validation_filename('CRU_CEDA', 'Precip')
             }
         }
         
@@ -115,7 +118,7 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
             
             print(f"   Обработка параметра {param}...")
             df_meteo = pd.read_csv(paths['meteo'])
-            df_cru = pd.read_csv(paths['cru'])
+            df_cru = read_prediction_csv(paths['cru'], 'CRU_CEDA')
             
             # Обеспечиваем типы данных для корректного слияния
             df_meteo['WMO'] = df_meteo['WMO'].astype(int)
@@ -314,7 +317,7 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
                 title_map = (
                     f"Пространственная корреляция фактических данных:\n"
                     f"Наблюдения Росгидрометра vs Архив CRU CEDA\n"
-                    f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | 1990-2020 гг."
+                    f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | {VALIDATION_PERIOD} гг."
                 )
                 file_map = f"Base_Correlation_Meteo_vs_CRU_{param}_{season_key}"
                 self.plot_correlation_map(station_lats, station_lons, station_corrs, title_map, file_map, season_key)
@@ -325,7 +328,7 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
                 title_scatter = (
                     f"Сопоставление фактических данных:\n"
                     f"Наблюдения Росгидрометра vs Архив CRU CEDA\n"
-                    f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | 1990-2020 гг."
+                    f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | {VALIDATION_PERIOD} гг."
                 )
                 file_scatter = f"Scatter_Meteo_vs_CRU_{param}_{season_key}"
                 self.plot_scatter(df_season['Fact_meteo'].values, df_season['Fact_cru'].values, overall_r, 
@@ -397,7 +400,7 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
                     # 1. Построение карты
                     title_map = (
                         f"Кросс-корреляция: Наблюдения Росгидрометра vs Прогноз CRU ({RU_MODELS[model_name]})\n"
-                        f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | Период: 1990-2020 гг."
+                        f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | Период: {VALIDATION_PERIOD} гг."
                     )
                     file_map = f"Cross_Correlation_Meteo_vs_CRU_{param}_{clean_model_name}_{season_key}"
                     self.plot_correlation_map(station_lats, station_lons, station_corrs, title_map, file_map, season_key)
@@ -408,7 +411,7 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
                     title_scatter = (
                         f"Кросс-сопоставление:\n"
                         f"Наблюдения Росгидрометра vs Прогноз CRU ({RU_MODELS[model_name]})\n"
-                        f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | 1990-2020 гг."
+                        f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | {VALIDATION_PERIOD} гг."
                     )
                     file_scatter = f"Scatter_Cross_Meteo_vs_CRU_{param}_{clean_model_name}_{season_key}"
                     self.plot_scatter(df_season['Fact_meteo'].values, df_season['Forecast_cru'].values, overall_r,
@@ -422,7 +425,7 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
         
         with open(summary_path, 'w', encoding='utf-8') as f:
             f.write("========================================================================\n")
-            f.write("СВОДНЫЙ ОТЧЕТ ПО СЕЗОННОМУ КРОСС-КОРРЕЛЯЦИОННОМУ АНАЛИЗУ (1990-2020 гг.)\n")
+            f.write(f"СВОДНЫЙ ОТЧЕТ ПО СЕЗОННОМУ КРОСС-КОРРЕЛЯЦИОННОМУ АНАЛИЗУ ({VALIDATION_PERIOD} гг.)\n")
             f.write("Сравнение: Наблюдения Росгидрометра (Meteo) vs База данных CRU CEDA\n")
             f.write("========================================================================\n\n")
             

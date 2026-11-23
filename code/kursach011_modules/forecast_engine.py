@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 import warnings
 
 from .meteo_data import load_monthly_meteo
+from .project_settings import CRU_VERSION, cru_csv_path, forecast_filename, validation_filename
 from .monthly_features import (
     create_forecast_features,
     create_time_features,
@@ -25,6 +26,24 @@ HISTORY_POLICIES = {
     'METEO_RU': 'complete_features_calendar_coverage',
     'CRU_CEDA': 'complete_features',
 }
+CRU_SOURCE_VERSION = f'CRU TS {CRU_VERSION}'
+
+
+def mark_prediction_source(df, dataset_name):
+    if dataset_name == 'CRU_CEDA':
+        df['Source_Version'] = CRU_SOURCE_VERSION
+
+
+def read_prediction_csv(path, dataset_name, *, nrows=None):
+    df = pd.read_csv(path, nrows=nrows)
+    if dataset_name == 'CRU_CEDA' and (
+        'Source_Version' not in df or not df['Source_Version'].eq(CRU_SOURCE_VERSION).all()
+    ):
+        raise ValueError(
+            f'{path}: требуется результат расчёта на {CRU_SOURCE_VERSION}. '
+            'Пересчитайте прогноз или валидацию.'
+        )
+    return df
 
 # Параметры (Regression Only)
 BEST_PARAMS = {
@@ -72,9 +91,11 @@ class BaseForecaster:
         print(f"[{self.__class__.__name__}] Инициализирован. Папка: {self.output_dir}")
 
     def _is_file_valid(self, filename, dataset_name):
-        """Проверяет, сохранены ли прогнозы с действующим правилом отбора строк."""
+        """Проверяет версию CRU и действующее правило отбора строк."""
         try:
-            df = pd.read_csv(self.output_dir / filename, nrows=1)
+            # Проверяем версию во всех строках CRU, включая вручную объединённые CSV.
+            nrows = None if dataset_name == 'CRU_CEDA' else 1
+            df = read_prediction_csv(self.output_dir / filename, dataset_name, nrows=nrows)
         except (OSError, ValueError):
             return False
 
@@ -88,6 +109,7 @@ class BaseForecaster:
     def _save_predictions(self, predictions, filename, dataset_name):
         df = pd.concat(predictions) if predictions else pd.DataFrame(columns=FORECAST_COLUMNS)
         df['History_Policy'] = HISTORY_POLICIES[dataset_name]
+        mark_prediction_source(df, dataset_name)
         with TemporaryDirectory(dir=self.output_dir) as temp_dir:
             temp_file = Path(temp_dir) / filename
             df.to_csv(temp_file, index=False)
@@ -118,7 +140,7 @@ class BaseForecaster:
             df_monthly = load_monthly_meteo(file_path, coords_path)
             
         elif dataset_name == 'CRU_CEDA':
-            file_path = self.base_dir / "cru ceda" / "cru_aligned_data.csv"
+            file_path = cru_csv_path(self.base_dir)
             if not file_path.exists():
                 print(f"ОШИБКА: Не найден файл {file_path}")
                 return pd.DataFrame()
@@ -174,7 +196,7 @@ class StandardForecaster(BaseForecaster):
         df_full = None # Ленивая загрузка
         
         for target_var in ['DTR', 'Precip']:
-            fname = f"{dataset_name}_{target_var}_{target_year}.csv"
+            fname = forecast_filename(dataset_name, target_var, target_year)
             
             # ПРОВЕРКА ФАЙЛА
             if self._is_file_valid(fname, dataset_name):
@@ -275,7 +297,7 @@ class LongTermValidator(BaseForecaster):
             test_years = list(range(split_year, final_year + 1))
             
             # ПРОВЕРКА ФАЙЛА
-            fname = f"Validation_{dataset_name}_{target_var}_{split_year}-{final_year}.csv"
+            fname = validation_filename(dataset_name, target_var, split_year, final_year)
             if self._is_file_valid(fname, dataset_name):
                 print(f"  [SKIP] Файл {fname} уже существует и корректен.")
                 continue

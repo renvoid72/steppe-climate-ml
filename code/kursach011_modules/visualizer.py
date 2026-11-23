@@ -6,9 +6,18 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 import xarray as xr
+from itertools import product
 from pathlib import Path
 import warnings
 import os
+
+from .forecast_engine import read_prediction_csv
+from .project_settings import (
+    ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, forecast_filename, validation_filename,
+)
+
+DATASETS = ('METEO_RU', 'CRU_CEDA')
+TARGETS = ('DTR', 'Precip')
 
 try:
     import geopandas as gpd
@@ -238,18 +247,22 @@ class StandardForecastVisualizer(BaseVisualizer):
     def __init__(self, base_dir, results_dir):
         super().__init__(base_dir, results_dir, "standard_forecast")
 
-    def run(self):
+    def run(self, year=ANALYSIS_YEAR):
         print("\n--- [Viz] Стандартный Прогноз (Сезонные карты) ---")
-        files = list(self.csv_dir.glob("*.csv"))
         seasons = {'Winter': [12, 1, 2], 'Spring': [3, 4, 5], 'Summer': [6, 7, 8], 'Autumn': [9, 10, 11]}
 
-        for f in files:
+        for dataset, var in product(DATASETS, TARGETS):
+            f = self.csv_dir / forecast_filename(dataset, var, year)
+            if not f.is_file():
+                continue
             print(f"  Обработка: {f.name}...")
             try:
-                df = pd.read_csv(f)
+                df = read_prediction_csv(f, dataset)
                 if 'Fact' not in df.columns: continue
                 df['Date'] = pd.to_datetime(df['Date'])
-                parts = f.stem.split('_'); year = parts[-1]; var = parts[-2]; dataset = "_".join(parts[:-2])
+                df = df.loc[df['Date'].dt.year.eq(year)]
+                if df.empty:
+                    continue
 
                 self._plot_full_graph(df, dataset, var, year, f"Graph_{dataset}_{var}_{year}")
                 
@@ -269,20 +282,20 @@ class ValidationVisualizer(BaseVisualizer):
     def __init__(self, base_dir, results_dir):
         super().__init__(base_dir, results_dir, "validation_results")
 
-    def run(self):
+    def run(self, start_year=VALIDATION_START_YEAR, end_year=VALIDATION_END_YEAR):
         print("\n--- [Viz] Валидация (Карты за весь период) ---")
-        files = list(self.csv_dir.glob("Validation_*.csv"))
-        for f in files:
+        years_range = f'{start_year}-{end_year}'
+        for dataset, var in product(DATASETS, TARGETS):
+            f = self.csv_dir / validation_filename(dataset, var, start_year, end_year)
+            if not f.is_file():
+                continue
             print(f"  Обработка: {f.name}...")
             try:
-                df = pd.read_csv(f)
+                df = read_prediction_csv(f, dataset)
                 df['Date'] = pd.to_datetime(df['Date'])
-                
-                # Парсинг имени для получения реальных дат
-                parts = f.stem.split('_')
-                var = parts[-2]
-                years_range = parts[-1] 
-                dataset = "_".join(parts[1:-2])
+                df = df.loc[df['Date'].dt.year.between(start_year, end_year)]
+                if df.empty:
+                    continue
                 
                 self._plot_full_graph(df, dataset, var, f"Период {years_range}", f"ValidGraph_{dataset}_{var}")
                 
