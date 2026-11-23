@@ -5,7 +5,7 @@
 замеряет точное время обучения, прогноза, скорость обработки данных и точность (R2, MAE, RMSE).
 
 Результаты НЕ сохраняются в CSV, а выгружаются в ЕДИНСТВЕННЫЙ итоговый файл:
-output011_modules/forecast_report.txt (относительно корня проекта)
+forecast_report.txt в каталоге результатов рабочей версии CRU.
 """
 
 import sys
@@ -18,12 +18,13 @@ import numpy as np
 import warnings
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from kursach011_modules.project_settings import ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, results_dir
 
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-RESULTS_DIR = PROJECT_DIR / "output011_modules"
+RESULTS_DIR = results_dir(PROJECT_DIR)
 REPORT_FILE = RESULTS_DIR / "forecast_report.txt"
 
 # Добавляем путь к модулям проекта
@@ -187,8 +188,8 @@ class ForecastReporter(BaseForecaster):
                     'RMSE': round(rmse, 4)
                 })
 
-    def run_validation_report(self, split_year, dataset_name, end_year=2020):
-        """Прогон и измерение метрик для Долгосрочной валидации (1990-2020 гг., 31 год)."""
+    def run_validation_report(self, split_year, dataset_name, end_year=VALIDATION_END_YEAR):
+        """Прогон и измерение метрик для долгосрочной валидации."""
         print("\n" + "="*80)
         print(f" БЛОК 2: ДОЛГОСРОЧНАЯ ВАЛИДАЦИЯ ({dataset_name} | Период: {split_year}-{end_year})")
         print("="*80)
@@ -261,10 +262,10 @@ class ForecastReporter(BaseForecaster):
                 print(f"    - Время прогноза (Predict Time):  {total_predict_time:.4f} сек")
                 print(f"    - Суммарное время (Total Time):   {total_time:.4f} сек")
                 print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_predict_time/len(test_years):.4f} сек/год)")
-                print(f"    - Метрики точности (1990-2020):   R2 = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
+                print(f"    - Метрики точности ({split_year}-{final_year}):   R2 = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
 
                 self.summary_table.append({
-                    'Блок': 'Валидация (1990-2020)',
+                    'Блок': f'Валидация ({split_year}-{final_year})',
                     'Датасет': dataset_name,
                     'Параметр': target_var,
                     'Модель': model_name,
@@ -309,12 +310,12 @@ def main():
         reporter = ForecastReporter(base_dir=PROJECT_DIR, root_output_dir=RESULTS_DIR)
 
         # 1. СТАНДАРТНЫЙ ПРОГНОЗ
-        reporter.run_standard_forecast_report(target_year=2024, dataset_name='METEO_RU')
-        reporter.run_standard_forecast_report(target_year=2020, dataset_name='CRU_CEDA')
+        reporter.run_standard_forecast_report(target_year=ANALYSIS_YEAR, dataset_name='METEO_RU')
+        reporter.run_standard_forecast_report(target_year=ANALYSIS_YEAR, dataset_name='CRU_CEDA')
 
-        # 2. ДОЛГОСРОЧНАЯ ВАЛИДАЦИЯ (1990-2020 гг.)
-        reporter.run_validation_report(split_year=1990, dataset_name='METEO_RU', end_year=2020)
-        reporter.run_validation_report(split_year=1990, dataset_name='CRU_CEDA', end_year=2020)
+        # 2. ДОЛГОСРОЧНАЯ ВАЛИДАЦИЯ
+        reporter.run_validation_report(split_year=VALIDATION_START_YEAR, dataset_name='METEO_RU', end_year=VALIDATION_END_YEAR)
+        reporter.run_validation_report(split_year=VALIDATION_START_YEAR, dataset_name='CRU_CEDA', end_year=VALIDATION_END_YEAR)
 
         # 3. ИТОГОВАЯ СВОДНАЯ ТАБЛИЦА
         reporter.print_summary_table()

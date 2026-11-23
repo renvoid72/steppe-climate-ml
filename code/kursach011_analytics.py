@@ -3,10 +3,10 @@
 Аналитический модуль постобработки данных курсовой работы.
 Задачи:
 1. Создание структуры директорий.
-2. Чтение данных долгосрочной валидации за 1990-2020 гг.
+2. Чтение данных долгосрочной валидации за общий период.
 3. Группировка по макрорегионам России и сохранение 4 Excel-файлов (с двумя таблицами бок о бок на 5 вкладках).
 4. Расчет статистических метрик точности моделей (R2, MAE, RMSE) по всей зоне степей.
-5. Генерация атласа из 208 карт за 2020 год с динамической шкалой и кубической интерполяцией.
+5. Генерация атласа карт за общий расчётный год с динамической шкалой и кубической интерполяцией.
 """
 
 import sys
@@ -23,13 +23,17 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
+from kursach011_modules.forecast_engine import read_prediction_csv
 from kursach011_modules.meteo_data import load_monthly_meteo
+from kursach011_modules.project_settings import (
+    ANALYSIS_YEAR, CRU_VERSION, VALIDATION_END_YEAR, VALIDATION_PERIOD, cru_csv_path, results_dir, validation_filename,
+)
 
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-RESULTS_DIR = PROJECT_DIR / "output011_modules"
+RESULTS_DIR = results_dir(PROJECT_DIR)
 ANALYTICS_DIR = RESULTS_DIR / "analytics_reports"
 
 # Добавляем путь к коду в sys.path, чтобы импортировать BaseVisualizer
@@ -103,9 +107,9 @@ def get_macroregion(lon):
         return 'Дальний Восток'
 
 
-def load_and_pivot_data(csv_path):
-    """Загружает CSV долгосрочной валидации и разворачивает модели по столбцам."""
-    df = pd.read_csv(csv_path)
+def pivot_forecasts(forecasts):
+    """Разворачивает результаты отдельных моделей по столбцам."""
+    df = forecasts.copy()
     df['Date'] = pd.to_datetime(df['Date'])
     df['Year'] = df['Date'].dt.year
     df['Month'] = df['Date'].dt.month
@@ -129,7 +133,7 @@ def load_and_pivot_data(csv_path):
 
 def generate_excel_reports(dataset_info):
     """Генерирует Excel-отчеты с 5 листами и 2 таблицами бок о бок."""
-    print("3. Генерация Excel-отчетов (1990-2020 гг.)...")
+    print(f"3. Генерация Excel-отчетов ({VALIDATION_PERIOD} гг.)...")
     
     regions_config = [
         ('Вся зона степей', None),
@@ -144,7 +148,7 @@ def generate_excel_reports(dataset_info):
         var = info['var']
         dataset = info['dataset']
         
-        file_name = f"{'Meteo_RU' if dataset == 'METEO_RU' else 'CRU_CEDA'}_{var}_1990-2020.xlsx"
+        file_name = f"{'Meteo_RU' if dataset == 'METEO_RU' else 'CRU_CEDA'}_{var}_{VALIDATION_PERIOD}.xlsx"
         output_path = ANALYTICS_DIR / file_name
         
         print(f"   Формирование отчета: {file_name}...")
@@ -198,7 +202,7 @@ def generate_excel_reports(dataset_info):
 
 
 def load_full_fact_data():
-    """Загружает полнопериодные фактические данные для Метео РФ (1960-2024) и CRU CEDA (1901-2020)."""
+    """Загружает фактические данные METEO_RU и CRU до общего расчётного года включительно."""
     print("3.1. Загрузка полнопериодных фактических данных...")
     fact_datasets = {}
 
@@ -206,18 +210,20 @@ def load_full_fact_data():
     meteo_txt = PROJECT_DIR / "meteo_ru" / "all_steppe_data.txt"
     coords_txt = PROJECT_DIR / "meteo_ru" / "stations_coords.txt"
     if meteo_txt.exists() and coords_txt.exists():
-        print("   Загрузка фактических данных Метео РФ (1960-2024 гг.)...")
+        print(f"   Загрузка фактических данных METEO_RU (1960-{ANALYSIS_YEAR} гг.)...")
         df_meteo_monthly = load_monthly_meteo(meteo_txt, coords_txt)
+        df_meteo_monthly = df_meteo_monthly.loc[df_meteo_monthly['Year'] <= ANALYSIS_YEAR].copy()
         df_meteo_monthly['Region'] = df_meteo_monthly['Longitude'].apply(get_macroregion)
         fact_datasets['METEO_RU'] = df_meteo_monthly
     else:
         print("   ! ВНИМАНИЕ: Файлы данных Метео РФ не найдены.")
 
     # 2. CRU CEDA
-    cru_csv = PROJECT_DIR / "cru ceda" / "cru_aligned_data.csv"
+    cru_csv = cru_csv_path(PROJECT_DIR)
     if cru_csv.exists():
-        print("   Загрузка фактических данных CRU CEDA (1901-2020 гг.)...")
+        print(f"   Загрузка фактических данных CRU TS {CRU_VERSION} (1901-{ANALYSIS_YEAR} гг.)...")
         df_cru = pd.read_csv(cru_csv)
+        df_cru = df_cru.loc[df_cru['Year'] <= ANALYSIS_YEAR].copy()
         df_cru['Region'] = df_cru['Longitude'].apply(get_macroregion)
         fact_datasets['CRU_CEDA'] = df_cru
     else:
@@ -283,13 +289,13 @@ def generate_fact_only_excel_reports(fact_datasets):
 
 
 def calculate_and_save_metrics(raw_datasets):
-    """Рассчитывает общие метрики точности за 1990-2020 гг. и сохраняет в metrics_summary.txt."""
-    print("4. Расчет общих метрик точности моделей (1990-2020 гг.)...")
+    """Рассчитывает метрики за общий период валидации и сохраняет их в metrics_summary.txt."""
+    print(f"4. Расчет общих метрик точности моделей ({VALIDATION_PERIOD} гг.)...")
     output_path = ANALYTICS_DIR / "metrics_summary.txt"
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("========================================================================\n")
-        f.write("СУММАРНЫЕ СТАТИСТИЧЕСКИЕ МЕТРИКИ ТОЧНОСТИ МОДЕЛЕЙ (1990-2020 гг.)\n")
+        f.write(f"СУММАРНЫЕ СТАТИСТИЧЕСКИЕ МЕТРИКИ ТОЧНОСТИ МОДЕЛЕЙ ({VALIDATION_PERIOD} гг.)\n")
         f.write("========================================================================\n\n")
 
         for key, info in raw_datasets.items():
@@ -323,8 +329,8 @@ def calculate_and_save_metrics(raw_datasets):
 
 
 def generate_map_atlas(dataset_info):
-    """Генерирует атлас карт за 2020 год (208 штук)."""
-    print("5. Запуск генерации атласа карт за 2020 год...")
+    """Генерирует атлас за последний год долгосрочной валидации."""
+    print(f"5. Запуск генерации атласа карт за {VALIDATION_END_YEAR} год...")
     
     if not HAS_VISUALIZER:
         print("ОШИБКА: Визуализатор не найден. Пропуск карт.")
@@ -352,10 +358,9 @@ def generate_map_atlas(dataset_info):
         var_label = 'Суточная амплитуда температуры, °C' if var == 'DTR' else 'Количество осадков, мм'
         ru_var_title = RU_VARS[var]
 
-        # Фильтруем за 2020 год
-        df_2020 = pivoted_df[pivoted_df['Year'] == 2020].copy()
-        if df_2020.empty:
-            print(f"   ВНИМАНИЕ: Нет данных за 2020 год для {dataset}_{var}!")
+        df_target_year = pivoted_df[pivoted_df['Year'] == VALIDATION_END_YEAR].copy()
+        if df_target_year.empty:
+            print(f"   ВНИМАНИЕ: Нет данных за {VALIDATION_END_YEAR} год для {dataset}_{var}!")
             continue
 
         # Определяем границы сетки по координатам всех станций этого датасета
@@ -371,18 +376,18 @@ def generate_map_atlas(dataset_info):
             if is_annual:
                 # Годовая агрегация для каждой станции
                 agg_func = 'mean' if var == 'DTR' else 'sum'
-                df_slice = df_2020.groupby(['WMO', 'Latitude', 'Longitude']).agg({
+                df_slice = df_target_year.groupby(['WMO', 'Latitude', 'Longitude']).agg({
                     'Fact': agg_func,
                     'Random Forest': agg_func,
                     'K-Neighbors': agg_func,
                     'MLP Neural Network': agg_func
                 }).reset_index()
                 slice_name = "Год"
-                title_time = "Годовой срез 2020 г."
+                title_time = f"Годовой срез {VALIDATION_END_YEAR} г."
             else:
-                df_slice = df_2020[df_2020['Month'] == month_idx].copy()
+                df_slice = df_target_year[df_target_year['Month'] == month_idx].copy()
                 slice_name = RU_MONTHS[month_idx]
-                title_time = f"{slice_name} 2020 г."
+                title_time = f"{slice_name} {VALIDATION_END_YEAR} г."
 
             if df_slice.empty:
                 continue
@@ -442,7 +447,7 @@ def generate_map_atlas(dataset_info):
                 
                 # Имена файлов и заголовки полностью на русском
                 ru_dataset_name = RU_DATASETS[dataset]
-                file_name_base = f"{ru_dataset_name}_{ru_var_title}_{model_file}_{slice_name}_2020"
+                file_name_base = f"{ru_dataset_name}_{ru_var_title}_{model_file}_{slice_name}_{VALIDATION_END_YEAR}"
                 
                 png_path = png_dir / f"{file_name_base}.png"
                 tiff_path = tiff_dir / f"{file_name_base}.tif"
@@ -509,22 +514,22 @@ def main():
     print("\n2. Загрузка исходных данных долгосрочной валидации...")
     csv_configs = {
         'meteo_dtr': {
-            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / 'Validation_METEO_RU_DTR_1990-2020.csv',
+            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / validation_filename('METEO_RU', 'DTR'),
             'dataset': 'METEO_RU',
             'var': 'DTR'
         },
         'meteo_precip': {
-            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / 'Validation_METEO_RU_Precip_1990-2020.csv',
+            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / validation_filename('METEO_RU', 'Precip'),
             'dataset': 'METEO_RU',
             'var': 'Precip'
         },
         'cru_dtr': {
-            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / 'Validation_CRU_CEDA_DTR_1990-2020.csv',
+            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / validation_filename('CRU_CEDA', 'DTR'),
             'dataset': 'CRU_CEDA',
             'var': 'DTR'
         },
         'cru_precip': {
-            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / 'Validation_CRU_CEDA_Precip_1990-2020.csv',
+            'path': RESULTS_DIR / 'validation_results' / 'csv_data' / validation_filename('CRU_CEDA', 'Precip'),
             'dataset': 'CRU_CEDA',
             'var': 'Precip'
         }
@@ -538,8 +543,12 @@ def main():
             return
         
         print(f"   Загрузка {config['path'].name}...")
-        df_raw = pd.read_csv(config['path'])
-        df_pivoted = load_and_pivot_data(config['path'])
+        try:
+            df_raw = read_prediction_csv(config['path'], config['dataset'])
+        except ValueError as error:
+            print(error)
+            return
+        df_pivoted = pivot_forecasts(df_raw)
         
         dataset_info[key] = {
             'raw': df_raw,
@@ -548,7 +557,7 @@ def main():
             'var': config['var']
         }
     
-    # Шаг 3. Отчеты Excel (1990-2020 гг.)
+    # Шаг 3. Отчеты Excel за общий период валидации
     print()
     generate_excel_reports(dataset_info)
     

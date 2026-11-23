@@ -8,28 +8,19 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-
-ALIGNED_FILENAME = 'cru_aligned_data.csv'
-LEGACY_NETCDF_FILENAMES = {
-    'dtr': 'temp dtr full rus stepp.nc',
-    'pre': 'precip full rus stepp.nc',
-}
-
+if __package__:
+    from .project_settings import ALIGNED_FILENAME, cru_data_dir
+else:
+    from project_settings import ALIGNED_FILENAME, cru_data_dir
 
 class CruDataLoader:
     def __init__(self, base_dir, cru_dir=None):
         base_dir = Path(base_dir)
         self.coords_file = base_dir / 'meteo_ru' / 'stations_coords.txt'
-        if cru_dir is None:
-            cru_dir = base_dir / 'cru ceda'
-            names = LEGACY_NETCDF_FILENAMES
-            self.mapping_file = None
-        else:
-            cru_dir = Path(cru_dir)
-            names = {'dtr': 'dtr.nc', 'pre': 'pre.nc'}
-            self.mapping_file = cru_dir / 'station_grid.csv'
-        self.cru_dtr_path = cru_dir / names['dtr']
-        self.cru_pre_path = cru_dir / names['pre']
+        cru_dir = cru_data_dir(base_dir) if cru_dir is None else Path(cru_dir)
+        self.mapping_file = cru_dir / 'station_grid.csv'
+        self.cru_dtr_path = cru_dir / 'dtr.nc'
+        self.cru_pre_path = cru_dir / 'pre.nc'
         self.out_file = cru_dir / ALIGNED_FILENAME
 
     def load_coordinates(self):
@@ -91,10 +82,9 @@ class CruDataLoader:
             staging = Path(staging)
             csv_path = staging / self.out_file.name
             self.final_df.to_csv(csv_path, index=False)
-            if self.mapping_file is not None:
-                grid_path = staging / self.mapping_file.name
-                self.station_grid.to_csv(grid_path, index=False)
-                grid_path.replace(self.mapping_file)
+            grid_path = staging / self.mapping_file.name
+            self.station_grid.to_csv(grid_path, index=False)
+            grid_path.replace(self.mapping_file)
             csv_path.replace(self.out_file)
 
     def run(self):

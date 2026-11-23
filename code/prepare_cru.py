@@ -1,4 +1,4 @@
-"""Подготовка региональных данных CRU TS 4.06 из официальных архивов."""
+"""Подготовка региональных данных CRU TS из официальных архивов."""
 
 import argparse
 from dataclasses import asdict, dataclass
@@ -9,22 +9,20 @@ from shutil import copyfileobj
 from tempfile import TemporaryDirectory
 from urllib.request import urlopen
 
-from netCDF4 import num2date
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from kursach011_modules.cru_loader import ALIGNED_FILENAME, LEGACY_NETCDF_FILENAMES, CruDataLoader
+from kursach011_modules.cru_loader import CruDataLoader
+from kursach011_modules.project_settings import CRU_VERSION, cru_csv_path, cru_data_dir
 
 
-VERSION = '4.06'
-ARCHIVE_ROOT = f'https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_{VERSION}/cruts.2205201912.v{VERSION}'
+ARCHIVE_ROOT = f'https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_{CRU_VERSION}/cruts.2604091129.v{CRU_VERSION}'
 VARIABLE_UNITS = {'dtr': 'degrees Celsius', 'pre': 'mm/month'}
 SOURCE_URLS = {
-    variable: f'{ARCHIVE_ROOT}/{variable}/cru_ts{VERSION}.1901.2021.{variable}.dat.nc.gz'
+    variable: f'{ARCHIVE_ROOT}/{variable}/cru_ts{CRU_VERSION}.1901.2025.{variable}.dat.nc.gz'
     for variable in VARIABLE_UNITS
 }
-CSV_KEY = ['WMO', 'Year', 'Month']
 
 
 @dataclass(frozen=True)
@@ -37,7 +35,7 @@ class Region:
     last_month: str
 
 
-REGION = Region(41.25, 59.75, 28.25, 124.75, '1901-01', '2020-12')
+REGION = Region(41.25, 59.75, 28.25, 124.75, '1901-01', '2025-12')
 
 
 def write_json(path, data):
@@ -122,109 +120,10 @@ def prepare_netcdf(output_dir, variable, url, region):
         (staging / regional.name).replace(regional)
 
 
-def numeric_differences(reference, result):
-    reference = np.asarray(reference)
-    result = np.asarray(result)
-    if reference.shape != result.shape:
-        return {
-            'reference_shape': list(reference.shape),
-            'result_shape': list(result.shape),
-            'missing_mask_differences': None,
-            'value_differences': None,
-            'max_abs_difference': None,
-            'matches': False,
-        }
-    reference_missing = pd.isna(reference)
-    result_missing = pd.isna(result)
-    both_present = ~(reference_missing | result_missing)
-    different = both_present & (reference != result)
-    missing_count = int(np.count_nonzero(reference_missing != result_missing))
-    different_count = int(np.count_nonzero(different))
-    max_abs = None
-    if different_count:
-        delta = reference[different].astype('float64') - result[different].astype('float64')
-        max_abs = float(np.abs(delta).max())
-    elif both_present.any():
-        max_abs = 0.0
-    return {
-        'missing_mask_differences': missing_count,
-        'value_differences': different_count,
-        'max_abs_difference': max_abs,
-        'matches': missing_count == different_count == 0,
-    }
-
-
-def compare_netcdf(reference_path, result_path, variable):
-    with xr.open_dataset(reference_path) as reference, xr.open_dataset(result_path) as result:
-        coordinates = {
-            name: np.array_equal(reference[name].values, result[name].values)
-            for name in ('lat', 'lon', 'time')
-        }
-        units = {
-            name: reference[name].attrs.get('units') == result[name].attrs.get('units')
-            for name in ('lat', 'lon', variable, 'stn')
-        }
-        reference_units = reference.time.encoding['units']
-        result_units = result.time.encoding['units']
-        reference_calendar = reference.time.encoding.get('calendar', 'standard')
-        result_calendar = result.time.encoding.get('calendar', 'standard')
-        # Origin and one unit of elapsed time must agree, even if the date strings differ.
-        units['time'] = reference_calendar == result_calendar and np.array_equal(
-            num2date([0, 1], reference_units, reference_calendar),
-            num2date([0, 1], result_units, result_calendar),
-        )
-        variables = {
-            name: numeric_differences(reference[name].values, result[name].values)
-            for name in (variable, 'stn')
-        }
-    return {
-        'coordinates_match': coordinates,
-        'units_match': units,
-        'time_units': {'reference': reference_units, 'result': result_units},
-        'variables': variables,
-        'matches': all(coordinates.values()) and all(units.values())
-        and all(stats['matches'] for stats in variables.values()),
-    }
-
-
-def compare_csv(reference_path, result_path):
-    reference = pd.read_csv(reference_path, float_precision='round_trip').set_index(CSV_KEY)
-    result = pd.read_csv(result_path, float_precision='round_trip').set_index(CSV_KEY)
-    reference_duplicates = int(reference.index.duplicated().sum())
-    result_duplicates = int(result.index.duplicated().sum())
-    reference = reference.loc[~reference.index.duplicated()]
-    result = result.loc[~result.index.duplicated()]
-    common = reference.index.intersection(result.index)
-    variables = {
-        name: numeric_differences(reference.loc[common, name].values, result.loc[common, name].values)
-        for name in ('DTR', 'Precip')
-    }
-    only_reference = len(reference.index.difference(result.index))
-    only_result = len(result.index.difference(reference.index))
-    return {
-        'reference_unique_keys': len(reference),
-        'result_unique_keys': len(result),
-        'common_keys': len(common),
-        'only_in_reference': only_reference,
-        'only_in_result': only_result,
-        'reference_duplicate_keys': reference_duplicates,
-        'result_duplicate_keys': result_duplicates,
-        'variables': variables,
-        'matches': reference_duplicates == result_duplicates == only_reference == only_result == 0
-        and all(stats['matches'] for stats in variables.values()),
-    }
-
-
-def prepare_cru(base_dir, verify=False, region=REGION):
-    cru_dir = base_dir / 'cru ceda'
-    output_dir = cru_dir / f'{VERSION}-reproduced'
-    reference_dir = cru_dir / VERSION
+def prepare_cru(base_dir, region=REGION):
+    output_dir = cru_data_dir(base_dir)
     loader = CruDataLoader(base_dir, cru_dir=output_dir)
     loader.load_coordinates()
-    if verify:
-        for filename in (*LEGACY_NETCDF_FILENAMES.values(), ALIGNED_FILENAME):
-            if not (reference_dir / filename).is_file():
-                raise FileNotFoundError(f'Эталонный файл не найден: {reference_dir / filename}')
 
     output_dir.mkdir(parents=True, exist_ok=True)
     for variable, url in SOURCE_URLS.items():
@@ -237,50 +136,28 @@ def prepare_cru(base_dir, verify=False, region=REGION):
     print(f'Станций в области: {len(grid)}, уникальных ячеек: {cell_count}, строк CSV: {len(loader.final_df)}.')
     print(f'Результаты: {output_dir}')
     write_json(output_dir / 'source.json', {
-        'version': VERSION,
+        'version': CRU_VERSION,
         'source_urls': SOURCE_URLS,
         'method': 'HTTPS .dat.nc.gz; local subset',
         'region_cell_centers_and_period': asdict(region),
         'grid_step_degrees': 0.5,
         'command': 'python code/prepare_cru.py',
-        'verification_command': 'python code/prepare_cru.py --verify',
     })
 
-    if not verify:
-        return True
-    nc_report = {
-        variable: compare_netcdf(reference_dir / filename, output_dir / f'{variable}.nc', variable)
-        for variable, filename in LEGACY_NETCDF_FILENAMES.items()
-    }
-    csv_report = compare_csv(reference_dir / ALIGNED_FILENAME, loader.out_file)
-    report = {
-        'netcdf': nc_report,
-        'station_csv': csv_report,
-        'station_grid': {
-            'station_count': len(grid),
-            'unique_grid_cells': cell_count,
-            '37054_and_37058': grid.loc[
-                grid['WMO'].isin([37054, 37058]), ['WMO', 'GridLatitude', 'GridLongitude']
-            ].to_dict('records'),
-        },
-        'matches': csv_report['matches'] and all(check['matches'] for check in nc_report.values()),
-    }
-    report_path = output_dir / 'verification.json'
-    write_json(report_path, report)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    print(f'Отчёт сверки: {report_path}')
-    return report['matches']
+
+def ensure_cru_csv(base_dir):
+    if not cru_csv_path(base_dir).is_file():
+        prepare_cru(base_dir)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--verify', action='store_true', help='Сверить результаты с файлами в cru ceda/4.06.')
-    args = parser.parse_args()
+    parser.parse_args()
     try:
-        matches = prepare_cru(Path(__file__).resolve().parents[1], verify=args.verify)
+        prepare_cru(Path(__file__).resolve().parents[1])
     except (OSError, ValueError) as error:
         parser.exit(1, f'Ошибка подготовки CRU: {error}\n')
-    return 0 if matches else 1
+    return 0
 
 
 if __name__ == '__main__':

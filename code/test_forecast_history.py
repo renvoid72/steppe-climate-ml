@@ -8,7 +8,9 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from kursach011_modules.forecast_engine import LongTermValidator, StandardForecaster
+from kursach011_modules.forecast_engine import (
+    CRU_SOURCE_VERSION, LongTermValidator, StandardForecaster, read_prediction_csv,
+)
 from kursach011_modules.monthly_features import create_forecast_features, select_model_rows
 
 
@@ -136,3 +138,60 @@ class ForecastHistoryTest(unittest.TestCase):
         results = pd.read_csv(forecaster.output_dir / 'CRU_CEDA_DTR_2021.csv')
         self.assertTrue(results.empty)
         self.assertIn('Forecast', results.columns)
+
+    def test_cru_cache_requires_current_source_version(self):
+        validator = LongTermValidator(self.output_dir, self.output_dir)
+        filename = 'Validation_CRU_CEDA_DTR_1990-2020.csv'
+        output = validator.output_dir / filename
+        forecast = self.source.iloc[:1].assign(
+            Forecast=10.0, Fact=10.0, Model='K-Neighbors', Target_Var='DTR',
+            History_Policy='complete_features',
+        )
+        old_version = forecast.assign(Source_Version='CRU TS 4.06')
+        mixed = pd.concat([forecast.assign(Source_Version=CRU_SOURCE_VERSION), old_version], ignore_index=True)
+        for stale in (forecast, old_version, mixed):
+            stale.to_csv(output, index=False)
+            self.assertFalse(validator._is_file_valid(filename, 'CRU_CEDA'))
+            with self.assertRaisesRegex(ValueError, 'требуется результат расчёта'):
+                read_prediction_csv(output, 'CRU_CEDA')
+
+        validator._save_predictions([forecast], filename, 'CRU_CEDA')
+        self.assertTrue(validator._is_file_valid(filename, 'CRU_CEDA'))
+        result = read_prediction_csv(output, 'CRU_CEDA')
+        self.assertEqual(result['Source_Version'].tolist(), [CRU_SOURCE_VERSION])
+
+    def test_maps_read_only_requested_period_and_current_cru(self):
+        from kursach011_modules.visualizer import StandardForecastVisualizer, ValidationVisualizer
+
+        forecast = self.source.iloc[:1].assign(
+            Forecast=10.0, Fact=10.0, Model='K-Neighbors', Target_Var='DTR',
+            Source_Version=CRU_SOURCE_VERSION,
+        )
+        cases = (
+            (StandardForecastVisualizer, '{dataset}_{variable}_{period}.csv', '2024', '2023', 2024),
+            (ValidationVisualizer, 'Validation_{dataset}_{variable}_{period}.csv', '1990-2020', '1990-2024', 2020),
+        )
+        for visualize, pattern, period, other_period, year in cases:
+            with self.subTest(visualize=visualize):
+                visualizer = visualize.__new__(visualize)
+                visualizer.csv_dir = Path(self.output_dir)
+                records = forecast.assign(Date=f'{year}-01-01')
+                for dataset in ('METEO_RU', 'CRU_CEDA'):
+                    name = pattern.format(dataset=dataset, variable='DTR', period=period)
+                    records.to_csv(visualizer.csv_dir / name, index=False)
+                old_period = pattern.format(dataset='METEO_RU', variable='Precip', period=other_period)
+                records.to_csv(visualizer.csv_dir / old_period, index=False)
+                old_cru = pattern.format(dataset='CRU_CEDA', variable='Precip', period=period)
+                records.assign(Source_Version='CRU TS 4.06').to_csv(visualizer.csv_dir / old_cru, index=False)
+
+                with (
+                    patch.object(visualizer, '_plot_full_graph') as graph,
+                    patch.object(visualizer, '_calculate_metrics'),
+                    patch.object(visualizer, '_save_map_netcdf_and_png') as save_map,
+                ):
+                    visualizer.run()
+
+                self.assertEqual([call.args[1:3] for call in graph.call_args_list], [
+                    ('METEO_RU', 'DTR'), ('CRU_CEDA', 'DTR'),
+                ])
+                self.assertEqual({call.args[3] for call in save_map.call_args_list}, {'METEO_RU', 'CRU_CEDA'})

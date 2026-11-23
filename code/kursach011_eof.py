@@ -2,13 +2,13 @@
 """
 Модуль математического разложения метеорологических полей методом ЕОФ (PCA).
 Задачи:
-1. Расчет ЕОФ (PCA) по 4 сезонам (Зима, Весна, Лето, Осень) за 1990-2020 гг.
+1. Расчет ЕОФ (PCA) по четырём сезонам за общий период валидации.
 2. Сохранение графиков и карт пространственных мод в сезонные подпапки.
 3. Группировка объясненной дисперсии по сезонам в variance_summary.txt.
 4. Расчет и экспорт исторических временных серий ЕОФ (PC-1, PC-2, PC-3)
    по 5 регионам на отдельные вкладки в Excel файлы:
-   - CRU CEDA (1920-2020 гг.)
-   - Метеостанции РФ (1960-2024 гг.)
+   - CRU (с 1920 г.)
+   - Метеостанции РФ (с 1960 г.)
 """
 
 import sys
@@ -26,13 +26,17 @@ from shapely.geometry import mapping
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
+from kursach011_modules.forecast_engine import read_prediction_csv
 from kursach011_modules.meteo_data import load_monthly_meteo
+from kursach011_modules.project_settings import (
+    ANALYSIS_YEAR, CRU_VERSION, VALIDATION_PERIOD, cru_csv_path, results_dir, validation_filename,
+)
 
 warnings.filterwarnings('ignore')
 
 # --- КОНСТАНТЫ ПУТЕЙ ---
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-RESULTS_DIR = PROJECT_DIR / "output011_modules"
+RESULTS_DIR = results_dir(PROJECT_DIR)
 EOF_DIR = RESULTS_DIR / "eof_results"
 
 # Добавляем путь к коду, чтобы импортировать BaseVisualizer
@@ -93,15 +97,15 @@ def load_meteo_ru_monthly():
 
 def load_cru_ceda_monthly():
     """Загружает готовые сеточные данные CRU CEDA."""
-    cru_file = PROJECT_DIR / "cru ceda" / "cru_aligned_data.csv"
+    cru_file = cru_csv_path(PROJECT_DIR)
     if not cru_file.exists():
-        raise FileNotFoundError("Файл cru_aligned_data.csv не найден в папке 'cru ceda'.")
+        raise FileNotFoundError(f"Файл CRU TS {CRU_VERSION} не найден: {cru_file}. Запустите code/prepare_cru.py.")
     df = pd.read_csv(cru_file)
     df['Date'] = pd.to_datetime(df[['Year', 'Month']].assign(day=1))
     return df
 
 
-def calculate_regional_pcs(df_monthly, param, lon_min=None, lon_max=None, start_year=1920, end_year=2024):
+def calculate_regional_pcs(df_monthly, param, lon_min=None, lon_max=None, start_year=1920, end_year=ANALYSIS_YEAR):
     """Выполняет разложение PCA для конкретного региона, параметра и периода."""
     # Фильтрация по годам
     df_sub = df_monthly[(df_monthly['Year'] >= start_year) & (df_monthly['Year'] <= end_year)].copy()
@@ -168,19 +172,20 @@ def export_historical_eof_series():
         {'name': 'Дальний Восток', 'lon_min': 120, 'lon_max': None}
     ]
 
-    # 1. CRU CEDA (1920-2020 гг.)
-    print("   Обработка CRU CEDA (1920-2020 гг.)...")
+    # 1. CRU (с 1920 г.)
+    cru_end_year = 2020
+    print(f"   Обработка CRU TS {CRU_VERSION} (1920-{cru_end_year} гг.)...")
     try:
         df_cru = load_cru_ceda_monthly()
-        cru_out_path = EOF_DIR / "CRU_CEDA_EOF_TimeSeries_1920-2020.xlsx"
+        cru_out_path = EOF_DIR / f"CRU_CEDA_EOF_TimeSeries_1920-{cru_end_year}.xlsx"
         
         with pd.ExcelWriter(cru_out_path, engine='openpyxl') as writer:
             for reg in regions_config:
                 sheet_name = reg['name']
                 print(f"      Регион: {sheet_name}...")
                 
-                dtr_pcs = calculate_regional_pcs(df_cru, 'DTR', reg['lon_min'], reg['lon_max'], 1920, 2020)
-                precip_pcs = calculate_regional_pcs(df_cru, 'Precip', reg['lon_min'], reg['lon_max'], 1920, 2020)
+                dtr_pcs = calculate_regional_pcs(df_cru, 'DTR', reg['lon_min'], reg['lon_max'], 1920, cru_end_year)
+                precip_pcs = calculate_regional_pcs(df_cru, 'Precip', reg['lon_min'], reg['lon_max'], 1920, cru_end_year)
                 
                 if dtr_pcs is not None and precip_pcs is not None:
                     # Объединяем PC для температуры и осадков на одной вкладке
@@ -203,19 +208,19 @@ def export_historical_eof_series():
     except Exception as e:
         print(f"   ! Ошибка при экспорте CRU CEDA: {e}")
 
-    # 2. МЕТЕО СТАНЦИИ РФ (1960-2024 гг.)
-    print("   Обработка Метеостанций РФ (1960-2024 гг.)...")
+    # 2. Метеостанции РФ
+    print(f"   Обработка метеостанций (1960-{ANALYSIS_YEAR} гг.)...")
     try:
         df_meteo = load_meteo_ru_monthly()
-        meteo_out_path = EOF_DIR / "Meteo_RU_EOF_TimeSeries_1960-2024.xlsx"
+        meteo_out_path = EOF_DIR / f"Meteo_RU_EOF_TimeSeries_1960-{ANALYSIS_YEAR}.xlsx"
         
         with pd.ExcelWriter(meteo_out_path, engine='openpyxl') as writer:
             for reg in regions_config:
                 sheet_name = reg['name']
                 print(f"      Регион: {sheet_name}...")
                 
-                dtr_pcs = calculate_regional_pcs(df_meteo, 'DTR', reg['lon_min'], reg['lon_max'], 1960, 2024)
-                precip_pcs = calculate_regional_pcs(df_meteo, 'Precip', reg['lon_min'], reg['lon_max'], 1960, 2024)
+                dtr_pcs = calculate_regional_pcs(df_meteo, 'DTR', reg['lon_min'], reg['lon_max'], 1960, ANALYSIS_YEAR)
+                precip_pcs = calculate_regional_pcs(df_meteo, 'Precip', reg['lon_min'], reg['lon_max'], 1960, ANALYSIS_YEAR)
                 
                 if dtr_pcs is not None and precip_pcs is not None:
                     # Объединяем PC для температуры и осадков на одной вкладке
@@ -245,19 +250,23 @@ def export_all_components_variance():
     
     datasets_config = [
         {
-            'file_name': 'Validation_METEO_RU_DTR_1990-2020.csv',
+            'name': 'METEO_RU',
+            'file_name': validation_filename('METEO_RU', 'DTR'),
             'out_name': 'Meteo_RU_DTR_EOF_Variance_All.xlsx'
         },
         {
-            'file_name': 'Validation_METEO_RU_Precip_1990-2020.csv',
+            'name': 'METEO_RU',
+            'file_name': validation_filename('METEO_RU', 'Precip'),
             'out_name': 'Meteo_RU_Precip_EOF_Variance_All.xlsx'
         },
         {
-            'file_name': 'Validation_CRU_CEDA_DTR_1990-2020.csv',
+            'name': 'CRU_CEDA',
+            'file_name': validation_filename('CRU_CEDA', 'DTR'),
             'out_name': 'CRU_CEDA_DTR_EOF_Variance_All.xlsx'
         },
         {
-            'file_name': 'Validation_CRU_CEDA_Precip_1990-2020.csv',
+            'name': 'CRU_CEDA',
+            'file_name': validation_filename('CRU_CEDA', 'Precip'),
             'out_name': 'CRU_CEDA_Precip_EOF_Variance_All.xlsx'
         }
     ]
@@ -279,7 +288,11 @@ def export_all_components_variance():
         out_path = EOF_DIR / item['out_name']
         print(f"   Формирование файла: {item['out_name']}...")
         
-        df = pd.read_csv(csv_path)
+        try:
+            df = read_prediction_csv(csv_path, item['name'])
+        except ValueError as error:
+            print(error)
+            continue
         df_unique = df.drop_duplicates(subset=['Date', 'WMO']).copy()
         
         with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
@@ -373,12 +386,12 @@ def main():
         mask = None
         world_map = None
 
-    # Конфигурация для расчетов ЕОФ по сезонам (1990-2020 гг.)
+    # Конфигурация для расчётов ЕОФ по сезонам
     datasets_config = [
         {
             'name': 'METEO_RU',
             'param': 'DTR',
-            'file_name': 'Validation_METEO_RU_DTR_1990-2020.csv',
+            'file_name': validation_filename('METEO_RU', 'DTR'),
             'title_ds': 'Метеостанции РФ',
             'title_param': 'DTR',
             'dir_name': 'meteo_ru'
@@ -386,7 +399,7 @@ def main():
         {
             'name': 'METEO_RU',
             'param': 'Precip',
-            'file_name': 'Validation_METEO_RU_Precip_1990-2020.csv',
+            'file_name': validation_filename('METEO_RU', 'Precip'),
             'title_ds': 'Метеостанции РФ',
             'title_param': 'Осадки',
             'dir_name': 'meteo_ru'
@@ -394,7 +407,7 @@ def main():
         {
             'name': 'CRU_CEDA',
             'param': 'DTR',
-            'file_name': 'Validation_CRU_CEDA_DTR_1990-2020.csv',
+            'file_name': validation_filename('CRU_CEDA', 'DTR'),
             'title_ds': 'CRU CEDA',
             'title_param': 'DTR',
             'dir_name': 'cru_ceda'
@@ -402,7 +415,7 @@ def main():
         {
             'name': 'CRU_CEDA',
             'param': 'Precip',
-            'file_name': 'Validation_CRU_CEDA_Precip_1990-2020.csv',
+            'file_name': validation_filename('CRU_CEDA', 'Precip'),
             'title_ds': 'CRU CEDA',
             'title_param': 'Осадки',
             'dir_name': 'cru_ceda'
@@ -411,7 +424,7 @@ def main():
 
     variance_results = []
 
-    print("\n2. Анализ ЕОФ по сезонам (1990-2020 гг.)...")
+    print(f"\n2. Анализ ЕОФ по сезонам ({VALIDATION_PERIOD} гг.)...")
     for item in datasets_config:
         csv_path = RESULTS_DIR / 'validation_results' / 'csv_data' / item['file_name']
         if not csv_path.exists():
@@ -421,7 +434,11 @@ def main():
         print(f"\n   Обработка {item['title_ds']} | {item['title_param']}...")
         
         # 1. Загрузка данных
-        df = pd.read_csv(csv_path)
+        try:
+            df = read_prediction_csv(csv_path, item['name'])
+        except ValueError as error:
+            print(error)
+            continue
         
         # Убираем дублирование из-за разных моделей, берем только факт
         df_unique = df.drop_duplicates(subset=['Date', 'WMO']).copy()
@@ -507,7 +524,7 @@ def main():
             plt.plot(anomalies_season.index, pcs[:, 2], label=f'PC-3 ({explained_var[2]:.2f}%)', color='#d62728', linewidth=1.5, marker='^', markersize=3)
             plt.axhline(0, color='black', linestyle='--', linewidth=0.8, alpha=0.7)
             
-            plt.title(f"Временной ход глав. компонент (PCs) | Сезон: {s_info['name_ru']}\n{item['title_ds']} | {item['title_param']} (1990-2020 гг.)", fontsize=12, fontweight='bold')
+            plt.title(f"Временной ход глав. компонент (PCs) | Сезон: {s_info['name_ru']}\n{item['title_ds']} | {item['title_param']} ({VALIDATION_PERIOD} гг.)", fontsize=12, fontweight='bold')
             plt.xlabel("Годы", fontsize=10)
             plt.ylabel("Амплитуда", fontsize=10)
             plt.legend(loc='upper right', fontsize=10)
@@ -596,7 +613,7 @@ def main():
     variance_summary_path = EOF_DIR / "variance_summary.txt"
     with open(variance_summary_path, 'w', encoding='utf-8') as f:
         f.write("========================================================================\n")
-        f.write("ДОЛИ ОБЪЯСНЕННОЙ ДИСПЕРСИИ ДЛЯ ПЕРВЫХ ТРЕХ МОД ЕОФ ПО СЕЗОНАМ (1990-2020 гг.)\n")
+        f.write(f"ДОЛИ ОБЪЯСНЕННОЙ ДИСПЕРСИИ ДЛЯ ПЕРВЫХ ТРЕХ МОД ЕОФ ПО СЕЗОНАМ ({VALIDATION_PERIOD} гг.)\n")
         f.write("========================================================================\n\n")
         
         # Группируем по сезонам
