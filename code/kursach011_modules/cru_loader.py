@@ -1,150 +1,110 @@
 # -*- coding: utf-8 -*-
-"""
-Модуль обработки данных CRU CEDA.
-Задачи:
-1. Читает координаты станций, полученные на этапе Meteo ETL.
-2. Извлекает данные из NetCDF файлов CRU (температура и осадки) для этих точек.
-3. Формирует единый CSV файл, синхронизированный со станциями.
-"""
+"""Извлечение месячных рядов CRU TS для ближайших к станциям ячеек."""
+
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import numpy as np
 import pandas as pd
 import xarray as xr
-from pathlib import Path
-import warnings
 
-# Отключаем предупреждения о датах (cftime)
-warnings.filterwarnings('ignore')
+
+ALIGNED_FILENAME = 'cru_aligned_data.csv'
+LEGACY_NETCDF_FILENAMES = {
+    'dtr': 'temp dtr full rus stepp.nc',
+    'pre': 'precip full rus stepp.nc',
+}
+
 
 class CruDataLoader:
-    def __init__(self, base_dir):
-        """
-        Инициализация путей.
-        base_dir: Корневая папка проекта
-        """
-        self.base_dir = Path(base_dir)
-        
-        # 1. Откуда берем координаты станций (результат работы Meteo Loader)
-        self.coords_file = self.base_dir / "meteo_ru" / "stations_coords.txt"
-        
-        # 2. Где лежат исходные карты CRU (NetCDF)
-        self.cru_dtr_path = self.base_dir / "cru ceda" / "temp dtr full rus stepp.nc"
-        self.cru_pre_path = self.base_dir / "cru ceda" / "precip full rus stepp.nc"
-        
-        # 3. Куда сохраним результат (Таблица)
-        self.out_file = self.base_dir / "cru ceda" / "cru_aligned_data.csv"
-        
-        self.stations_df = None
-        self.final_df = pd.DataFrame()
+    def __init__(self, base_dir, cru_dir=None):
+        base_dir = Path(base_dir)
+        self.coords_file = base_dir / 'meteo_ru' / 'stations_coords.txt'
+        if cru_dir is None:
+            cru_dir = base_dir / 'cru ceda'
+            names = LEGACY_NETCDF_FILENAMES
+            self.mapping_file = None
+        else:
+            cru_dir = Path(cru_dir)
+            names = {'dtr': 'dtr.nc', 'pre': 'pre.nc'}
+            self.mapping_file = cru_dir / 'station_grid.csv'
+        self.cru_dtr_path = cru_dir / names['dtr']
+        self.cru_pre_path = cru_dir / names['pre']
+        self.out_file = cru_dir / ALIGNED_FILENAME
 
     def load_coordinates(self):
-        """Читает список станций, для которых нужно добыть данные"""
-        print("\n[CRU] Шаг 1: Чтение координат станций...")
-        
-        if not self.coords_file.exists():
-            raise FileNotFoundError(f"Файл координат не найден: {self.coords_file}\nСначала запустите Meteo Loader!")
-            
-        # Читаем txt с пробелами как разделителями
+        if not self.coords_file.is_file():
+            raise FileNotFoundError(
+                f'Файл координат не найден: {self.coords_file}. Сначала запустите Meteo Loader.'
+            )
         self.stations_df = pd.read_csv(self.coords_file, sep=r'\s+')
-        print(f"  -> Найдено {len(self.stations_df)} станций для обработки.")
+        if self.stations_df.empty or self.stations_df['WMO'].isna().any():
+            raise ValueError('В файле координат должны быть станции с заполненным WMO.')
+        if self.stations_df['WMO'].duplicated().any():
+            raise ValueError('В файле координат есть повторяющиеся WMO.')
 
     def extract_data(self):
-        """
-        Самая главная часть: 'Бурение' карт NetCDF.
-        Для каждой точки (Lat/Lon) извлекаем временной ряд.
-        """
-        print("[CRU] Шаг 2: Извлечение данных из NetCDF (это может занять время)...")
-        
-        if not self.cru_dtr_path.exists() or not self.cru_pre_path.exists():
-            raise FileNotFoundError("Не найдены файлы .nc в папке 'cru ceda'. Проверьте имена файлов!")
+        stations = self.stations_df
+        with xr.open_dataset(self.cru_dtr_path) as dtr_ds, xr.open_dataset(self.cru_pre_path) as pre_ds:
+            for axis in ('lat', 'lon', 'time'):
+                if not np.array_equal(dtr_ds[axis].values, pre_ds[axis].values):
+                    raise ValueError(f'Координата {axis} различается между NetCDF DTR и осадков.')
 
-        # Открываем "лениво" (без загрузки всего файла в память)
-        try:
-            ds_dtr = xr.open_dataset(self.cru_dtr_path)
-            ds_pre = xr.open_dataset(self.cru_pre_path)
-        except Exception as e:
-            raise RuntimeError(f"Ошибка открытия NetCDF: {e}")
+            in_region = (
+                stations['Lat'].between(float(dtr_ds.lat.min()), float(dtr_ds.lat.max()))
+                & stations['Lon'].between(float(dtr_ds.lon.min()), float(dtr_ds.lon.max()))
+            )
+            if not in_region.all():
+                outside = ', '.join(stations.loc[~in_region, 'WMO'].astype(str))
+                raise ValueError(f'Отсутствуют координаты или станция вне региона CRU: {outside}')
 
-        # Проверяем имена переменных внутри файлов (обычно это 'dtr' и 'pre')
-        # Если имена другие, скрипт может упасть, но обычно в CRU TS они такие.
-        var_dtr = 'dtr' if 'dtr' in ds_dtr else list(ds_dtr.data_vars)[0]
-        var_pre = 'pre' if 'pre' in ds_pre else list(ds_pre.data_vars)[0]
-        
-        cru_data_list = []
-        total = len(self.stations_df)
-        
-        # Проходим по каждой станции
-        for i, row in self.stations_df.iterrows():
-            wmo_id = int(row['WMO'])
-            lat = row['Lat']
-            lon = row['Lon']
-            
-            # Красивый вывод прогресса
-            if i % 10 == 0:
-                print(f"  -> Обработка станции {i+1}/{total}...", end='\r')
+            selector = {
+                'lat': xr.DataArray(stations['Lat'].to_numpy(), dims='station'),
+                'lon': xr.DataArray(stations['Lon'].to_numpy(), dims='station'),
+            }
+            dtr = dtr_ds.get('dtr', dtr_ds[next(iter(dtr_ds.data_vars))])
+            pre = pre_ds.get('pre', pre_ds[next(iter(pre_ds.data_vars))])
+            dtr = dtr.load().sel(selector, method='nearest').transpose('station', 'time')
+            pre = pre.load().sel(selector, method='nearest').transpose('station', 'time')
 
-            try:
-                # .sel(..., method='nearest') находит ближайший пиксель сетки к координатам станции
-                dtr_series = ds_dtr[var_dtr].sel(lat=lat, lon=lon, method='nearest').to_pandas()
-                pre_series = ds_pre[var_pre].sel(lat=lat, lon=lon, method='nearest').to_pandas()
-                
-                # Создаем мини-таблицу для одной станции
-                df_station = pd.DataFrame({
-                    'DTR': dtr_series,
-                    'Precip': pre_series
-                }).reset_index()
-                
-                # Переименовываем колонку с датой (xarray может назвать её 'time')
-                df_station.rename(columns={'time': 'Date', 'index': 'Date'}, inplace=True)
-                
-                # Добавляем метаданные (чтобы знать, чьи это данные)
-                df_station['WMO'] = wmo_id
-                df_station['Latitude'] = lat
-                df_station['Longitude'] = lon
-                
-                # Извлекаем Год и Месяц для удобства
-                df_station['Year'] = df_station['Date'].dt.year
-                df_station['Month'] = df_station['Date'].dt.month
-                
-                # Убираем пустые строки (если станция попала в океан или данные кончились)
-                df_station = df_station.dropna(subset=['DTR', 'Precip'])
-                
-                cru_data_list.append(df_station)
-                
-            except Exception as e:
-                print(f"\n  ! Ошибка для станции {wmo_id}: {e}")
+        self.station_grid = stations[['WMO', 'Lat', 'Lon']].rename(
+            columns={'Lat': 'Latitude', 'Lon': 'Longitude'}
+        ).assign(GridLatitude=dtr.lat.values, GridLongitude=dtr.lon.values)
+        self.station_grid = self.station_grid.sort_values('WMO')
 
-        # Собираем всё в одну большую таблицу
-        if cru_data_list:
-            self.final_df = pd.concat(cru_data_list)
-            print(f"\n  -> Успешно! Собрано {len(self.final_df)} строк данных.")
-        else:
-            print("\n  -> Ошибка: Не удалось извлечь данные ни для одной станции.")
+        dates = pd.DatetimeIndex(dtr.time.values)
+        self.final_df = pd.DataFrame({
+            'Date': np.tile(dates, len(stations)),
+            'DTR': dtr.values.ravel(),
+            'Precip': pre.values.ravel(),
+            'WMO': np.repeat(stations['WMO'].to_numpy(), len(dates)),
+            'Latitude': np.repeat(stations['Lat'].to_numpy(), len(dates)),
+            'Longitude': np.repeat(stations['Lon'].to_numpy(), len(dates)),
+            'Year': np.tile(dates.year, len(stations)),
+            'Month': np.tile(dates.month, len(stations)),
+        }).dropna(subset=['DTR', 'Precip']).sort_values(['WMO', 'Year', 'Month'])
 
     def save_data(self):
-        """Сохраняет результат в CSV"""
-        print("[CRU] Шаг 3: Сохранение...")
-        
-        if not self.final_df.empty:
-            # Сортировка для порядка
-            self.final_df = self.final_df.sort_values(by=['WMO', 'Year', 'Month'])
-            
-            # Сохраняем в CSV с заголовком (header=True) и запятыми
-            self.final_df.to_csv(self.out_file, index=False)
-            print(f"  -> Файл готов: {self.out_file}")
-            print("  Теперь этот файл можно использовать в прогнозе вместо тяжелых NetCDF.")
-        else:
-            print("  -> Нечего сохранять.")
+        if self.final_df.empty:
+            raise ValueError('Для указанных станций нет месяцев с DTR и осадками.')
+        with TemporaryDirectory(dir=self.out_file.parent) as staging:
+            staging = Path(staging)
+            csv_path = staging / self.out_file.name
+            self.final_df.to_csv(csv_path, index=False)
+            if self.mapping_file is not None:
+                grid_path = staging / self.mapping_file.name
+                self.station_grid.to_csv(grid_path, index=False)
+                grid_path.replace(self.mapping_file)
+            csv_path.replace(self.out_file)
 
     def run(self):
-        """Запуск модуля"""
-        print("-" * 60)
-        print("ЗАПУСК МОДУЛЯ ОБРАБОТКИ CRU CEDA")
         self.load_coordinates()
         self.extract_data()
         self.save_data()
-        print("-" * 60)
+        cells = self.station_grid[['GridLatitude', 'GridLongitude']].drop_duplicates()
+        print(f'CRU: {len(self.station_grid)} станций, {len(cells)} ячеек, {len(self.final_df)} строк.')
+        print(f'Станционный CSV: {self.out_file}')
 
-# Для тестирования (если запускать этот файл отдельно)
-if __name__ == "__main__":
-    PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-    loader = CruDataLoader(PROJECT_DIR)
-    loader.run()
+
+if __name__ == '__main__':
+    CruDataLoader(Path(__file__).resolve().parents[2]).run()
