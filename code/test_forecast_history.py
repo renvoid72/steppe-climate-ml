@@ -14,7 +14,7 @@ from kursach011_modules.forecast_engine import (
     CRU_SOURCE_VERSION, LongTermValidator, StandardForecaster, read_prediction_csv, read_validation_csv,
 )
 from kursach011_modules.monthly_features import create_forecast_features, prepare_forecast_period, select_model_rows
-from kursach011_modules.project_settings import validation_filename
+from kursach011_modules.project_settings import forecast_filename, validation_filename
 
 
 class ForecastHistoryTest(unittest.TestCase):
@@ -262,3 +262,75 @@ class ForecastHistoryTest(unittest.TestCase):
                     ('METEO_RU', 'DTR'), ('CRU_CEDA', 'DTR'),
                 ])
                 self.assertEqual({call.args[3] for call in save_map.call_args_list}, {'METEO_RU', 'CRU_CEDA'})
+
+
+class ForecastGraphTest(unittest.TestCase):
+    def plot_from_csv(self, visualizer_class, filename, rows):
+        from kursach011_modules.visualizer import plt
+
+        results = pd.DataFrame(rows, columns=['Date', 'WMO', 'Model', 'Fact', 'Forecast'])
+        results['Forecast_Mode'] = ANNUAL_FORECAST_MODE
+        plotted = {}
+
+        def capture_graph(*args, **kwargs):
+            for line in plt.gca().lines:
+                dates = pd.DatetimeIndex(line.get_xdata())
+                plotted[line.get_label()] = pd.Series(line.get_ydata(), index=dates)
+
+        with TemporaryDirectory() as output:
+            visualizer = visualizer_class(output, output)
+            visualizer.csv_dir.mkdir()
+            results.to_csv(visualizer.csv_dir / filename, index=False)
+            with (
+                patch.object(visualizer, '_calculate_metrics'),
+                patch.object(visualizer, '_save_map_netcdf_and_png'),
+                patch.object(plt, 'savefig', side_effect=capture_graph),
+            ):
+                visualizer.run()
+
+        return pd.DataFrame(plotted)
+
+    def test_standard_graph_uses_paired_stations_and_keeps_monthly_gaps(self):
+        from kursach011_modules.visualizer import RU_TITLES, StandardForecastVisualizer
+
+        model = 'K-Neighbors'
+        rows = [
+            ('2024-01-01', 'A', model, 0., 4.),
+            ('2024-01-01', 'B', model, 60., 40.),
+            ('2024-01-01', 'C', model, np.nan, 100.),
+            ('2024-02-01', 'A', model, 10., np.nan),
+            ('2024-02-01', 'C', model, np.nan, 120.),
+            ('2024-04-01', 'B', model, 12., 11.),
+        ]
+        plotted = self.plot_from_csv(StandardForecastVisualizer, forecast_filename('METEO_RU', 'Precip'), rows)
+
+        expected = pd.DataFrame({
+            RU_TITLES['Fact']: [30., np.nan, np.nan, 12.],
+            RU_TITLES[model]: [22., np.nan, np.nan, 11.],
+        }, index=pd.date_range('2024-01-01', periods=4, freq='MS'))
+        pd.testing.assert_frame_equal(plotted, expected, check_freq=False)
+
+    def test_validation_graph_uses_intersection_of_stations_for_all_models(self):
+        from kursach011_modules.visualizer import RU_TITLES, ValidationVisualizer
+
+        rf, knn = 'Random Forest', 'K-Neighbors'
+        rows = [
+            ('2019-01-01', 'A', rf, 60., 40.),
+            ('2019-01-01', 'A', knn, 60., 45.),
+            ('2019-01-01', 'B', rf, 90., 80.),
+            ('2019-01-01', 'C', knn, 20., 10.),
+            ('2019-02-01', 'A', rf, 15., 10.),
+            ('2019-02-01', 'B', knn, 15., 10.),
+            ('2019-03-01', 'B', rf, 20., 15.),
+            ('2019-03-01', 'B', knn, 20., 18.),
+            ('2019-04-01', 'B', rf, np.nan, 15.),
+            ('2019-04-01', 'B', knn, np.nan, 18.),
+        ]
+        plotted = self.plot_from_csv(ValidationVisualizer, validation_filename('METEO_RU', 'Precip'), rows)
+
+        expected = pd.DataFrame({
+            RU_TITLES['Fact']: [60., np.nan, 20., np.nan],
+            RU_TITLES[rf]: [40., np.nan, 15., np.nan],
+            RU_TITLES[knn]: [45., np.nan, 18., np.nan],
+        }, index=pd.date_range('2019-01-01', periods=4, freq='MS'))
+        pd.testing.assert_frame_equal(plotted, expected, check_freq=False)
