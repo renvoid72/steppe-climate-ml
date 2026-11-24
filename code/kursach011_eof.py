@@ -26,7 +26,7 @@ from shapely.geometry import mapping
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from kursach011_modules.forecast_engine import read_prediction_csv
+from kursach011_modules.forecast_engine import read_validation_csv
 from kursach011_modules.meteo_data import load_monthly_meteo
 from kursach011_modules.project_settings import (
     ANALYSIS_YEAR, CRU_VERSION, VALIDATION_PERIOD, cru_csv_path, results_dir, validation_filename,
@@ -289,7 +289,7 @@ def export_all_components_variance():
         print(f"   Формирование файла: {item['out_name']}...")
         
         try:
-            df = read_prediction_csv(csv_path, item['name'])
+            df = read_validation_csv(csv_path, item['name'])
         except ValueError as error:
             print(error)
             continue
@@ -435,7 +435,7 @@ def main():
         
         # 1. Загрузка данных
         try:
-            df = read_prediction_csv(csv_path, item['name'])
+            df = read_validation_csv(csv_path, item['name'])
         except ValueError as error:
             print(error)
             continue

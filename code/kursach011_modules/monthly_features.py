@@ -36,6 +36,28 @@ def create_forecast_features(df, forecast_date):
     return create_time_features(pd.concat([history, future], ignore_index=True))
 
 
+def prepare_forecast_period(df, forecast_dates):
+    """Возвращает историю и строки прогноза с общим расчётом лагов для всех дат."""
+    dates = pd.DataFrame({'Date': pd.DatetimeIndex(forecast_dates).unique()})
+    history = df.loc[df['Date'] < dates['Date'].max()]
+    station = ['WMO', 'Latitude', 'Longitude']
+    first_seen = history.groupby(station, as_index=False, observed=True)['Date'].min()
+    candidates = first_seen.rename(columns={'Date': 'FirstDate'}).merge(dates, how='cross')
+    candidates = candidates.loc[candidates['FirstDate'] < candidates['Date'], station + ['Date']]
+
+    # Добавляем отсутствующие месяцы для прогноза, сохраняя факты для последующих лагов.
+    keys = ['WMO', 'Date']
+    observed = pd.MultiIndex.from_frame(history[keys])
+    missing = candidates.loc[~pd.MultiIndex.from_frame(candidates[keys]).isin(observed)]
+    calendar = pd.concat([history, missing], ignore_index=True)
+    features = create_time_features(calendar)
+
+    # Для прогноза берём только календарь и вычисленные признаки, без фактов месяца.
+    derived = [col for col in features if col not in calendar]
+    future = candidates.merge(features[keys + derived], on=keys, validate='one_to_one', sort=True)
+    return features.loc[features.index < len(history)], future.reindex(columns=features.columns)
+
+
 def create_time_features(df):
     """Добавляет временные признаки к таблице с одной строкой на станцию и месяц."""
     df = df.sort_values(['WMO', 'Date']).copy()

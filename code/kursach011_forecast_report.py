@@ -31,7 +31,8 @@ REPORT_FILE = RESULTS_DIR / "forecast_report.txt"
 sys.path.append(str(PROJECT_DIR / "code"))
 
 from kursach011_modules.forecast_engine import BaseForecaster, BEST_PARAMS
-from kursach011_modules.monthly_features import create_forecast_features, model_feature_columns, select_model_rows
+from kursach011_modules.annual_forecast import annual_prediction_rows, annual_targets, prepare_annual_features, print_monthly_errors
+from kursach011_modules.monthly_features import prepare_forecast_period, model_feature_columns, select_model_rows
 
 
 class DualLogger:
@@ -64,7 +65,7 @@ class ForecastReporter(BaseForecaster):
         super().__init__(base_dir, root_output_dir, "temp_report")
         self.summary_table = []
 
-    def _timed_fit_predict(self, df_train, df_test, model_name, target_var, dataset_name):
+    def _timed_fit_predict(self, df_train, df_test, model_name, target_var, dataset_name, *, y_train=None):
         """
         Идентичная обучающая логика _fit_predict_model из forecast_engine.py,
         но с раздельным хронометрированием этапов fit() и predict().
@@ -81,7 +82,10 @@ class ForecastReporter(BaseForecaster):
             
         model = self.model_classes[model_name](**params, **model_args)
         
-        y_train = np.log1p(df_train[target_var]) if target_var == 'Precip' else df_train[target_var]
+        if y_train is None:
+            y_train = df_train[target_var]
+        if target_var == 'Precip':
+            y_train = np.log1p(y_train)
         
         X_train_scaled = scaler.transform(df_train[feature_cols])
         X_test_scaled = scaler.transform(df_test[feature_cols])
@@ -101,12 +105,13 @@ class ForecastReporter(BaseForecaster):
         final_preds = np.expm1(raw_preds) if target_var == 'Precip' else raw_preds
         final_preds = np.maximum(0, final_preds)
 
-        return final_preds, fit_time, predict_time, len(df_test)
+        return final_preds, fit_time, predict_time, final_preds.size
 
     def run_standard_forecast_report(self, target_year, dataset_name):
-        """Прогон и измерение метрик для Стандартного прогноза на 1 год."""
+        """Помесячная оценка с горизонтом один месяц и ежемесячным обучением."""
         print("\n" + "="*80)
-        print(f" БЛОК 1: СТАНДАРТНЫЙ ПРОГНОЗ ({dataset_name} | Год прогноза: {target_year})")
+        print(f" БЛОК 1: ПРОГНОЗ НА МЕСЯЦ ({dataset_name} | Период оценки: {target_year})")
+        print(" Переобучение ежемесячно")
         print("="*80)
 
         t_load_start = time.perf_counter()
@@ -118,7 +123,11 @@ class ForecastReporter(BaseForecaster):
             print("  ОШИБКА: Данные не загружены.")
             return
 
+        forecast_dates = pd.date_range(f'{target_year}-01-01', periods=12, freq='MS')
+        history, forecast_rows = prepare_forecast_period(df_full, forecast_dates)
+        eligible_forecasts = select_model_rows(forecast_rows)
         for target_var in ['DTR', 'Precip']:
+            train_rows = select_model_rows(history, target_var)
             print(f"\n---> Параметр: {target_var} <---")
             for model_name in self.model_classes.keys():
                 print(f"\n  * Модель: {model_name}")
@@ -130,13 +139,9 @@ class ForecastReporter(BaseForecaster):
                 all_facts = []
 
                 # Walk-Forward по 12 месяцам года
-                for month_num in range(1, 13):
-                    forecast_date = pd.to_datetime(f"{target_year}-{month_num:02d}-01")
-                    
-                    df_features = create_forecast_features(df_full, forecast_date)
-
-                    df_train = select_model_rows(df_features[df_features['Date'] < forecast_date], target_var)
-                    df_pred = select_model_rows(df_features[df_features['Date'] == forecast_date])
+                for forecast_date in forecast_dates:
+                    df_train = train_rows.loc[train_rows['Date'] < forecast_date]
+                    df_pred = eligible_forecasts.loc[eligible_forecasts['Date'] == forecast_date]
                     
                     if not self._can_predict(df_train, df_pred, model_name, target_var, dataset_name):
                         continue
@@ -191,7 +196,8 @@ class ForecastReporter(BaseForecaster):
     def run_validation_report(self, split_year, dataset_name, end_year=VALIDATION_END_YEAR):
         """Прогон и измерение метрик для долгосрочной валидации."""
         print("\n" + "="*80)
-        print(f" БЛОК 2: ДОЛГОСРОЧНАЯ ВАЛИДАЦИЯ ({dataset_name} | Период: {split_year}-{end_year})")
+        print(f" БЛОК 2: ПРЯМОЙ ПРОГНОЗ НА 12 МЕСЯЦЕВ ({dataset_name} | Период оценки: {split_year}-{end_year})")
+        print(" Переобучение ежегодно")
         print("="*80)
 
         t_load_start = time.perf_counter()
@@ -211,7 +217,9 @@ class ForecastReporter(BaseForecaster):
             print("  Нет годов для валидации.")
             return
 
+        features = select_model_rows(prepare_annual_features(df_full, final_year))
         for target_var in ['DTR', 'Precip']:
+            targets = annual_targets(df_full, features, target_var)
             print(f"\n---> Параметр: {target_var} <---")
 
             for model_name in self.model_classes.keys():
@@ -220,36 +228,25 @@ class ForecastReporter(BaseForecaster):
                 total_fit_time = 0.0
                 total_predict_time = 0.0
                 total_samples = 0
-                all_preds = []
-                all_facts = []
-
-                # Yearly Walk-Forward
-                for year in test_years:
-                    split_date = pd.to_datetime(f"{year}-01-01")
-                    
-                    df_current_slice = df_full[df_full['Year'] <= year].copy()
-                    df_features = self.create_features(df_current_slice)
-                    
-                    df_train = select_model_rows(df_features[df_features['Date'] < split_date], target_var)
-                    df_test = select_model_rows(df_features[df_features['Year'] == year], target_var)
-                    
-                    if not self._can_predict(df_train, df_test, model_name, target_var, dataset_name):
-                        continue
-
+                results = []
+                splits = self.annual_model_splits(features, targets, test_years, model_name, target_var, dataset_name)
+                for df_train, df_test, y_train, facts in splits:
                     preds, fit_t, pred_t, n_samp = self._timed_fit_predict(
-                        df_train, df_test, model_name, target_var, dataset_name
+                        df_train, df_test, model_name, target_var, dataset_name, y_train=y_train,
                     )
 
                     total_fit_time += fit_t
                     total_predict_time += pred_t
                     total_samples += n_samp
 
-                    all_preds.extend(preds)
-                    all_facts.extend(df_test[target_var].values)
+                    results.append(annual_prediction_rows(df_test, preds, facts, model_name, target_var))
 
-                # Расчет итоговых метрик по модели
-                clean_facts = np.array(all_facts)
-                clean_preds = np.array(all_preds)
+                if results:
+                    paired = pd.concat(results).dropna(subset=['Fact'])
+                    clean_facts, clean_preds = paired['Fact'], paired['Forecast']
+                    print_monthly_errors(paired)
+                else:
+                    clean_facts, clean_preds = [], []
 
                 r2 = r2_score(clean_facts, clean_preds) if len(clean_facts) > 1 else np.nan
                 mae = mean_absolute_error(clean_facts, clean_preds) if len(clean_facts) else np.nan
@@ -263,6 +260,7 @@ class ForecastReporter(BaseForecaster):
                 print(f"    - Суммарное время (Total Time):   {total_time:.4f} сек")
                 print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_predict_time/len(test_years):.4f} сек/год)")
                 print(f"    - Метрики точности ({split_year}-{final_year}):   R2 = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
+                print(f"    - Месячных прогнозов: {total_samples}, пар с фактом: {len(clean_facts)}")
 
                 self.summary_table.append({
                     'Блок': f'Валидация ({split_year}-{final_year})',

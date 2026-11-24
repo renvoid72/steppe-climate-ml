@@ -23,7 +23,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
-from kursach011_modules.forecast_engine import read_prediction_csv
+from kursach011_modules.forecast_engine import read_validation_csv
+from kursach011_modules.annual_forecast import FORECAST_MONTHS
 from kursach011_modules.meteo_data import load_monthly_meteo
 from kursach011_modules.project_settings import (
     ANALYSIS_YEAR, CRU_VERSION, VALIDATION_END_YEAR, VALIDATION_PERIOD, cru_csv_path, results_dir, validation_filename,
@@ -131,6 +132,14 @@ def pivot_forecasts(forecasts):
     return pivoted
 
 
+def aggregate_annual_forecasts(monthly, group_columns, target_var):
+    """Считает годовые значения по полным 12-месячным рядам."""
+    columns = ['Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network']
+    groups = monthly.groupby(group_columns)[columns]
+    aggregate = groups.mean() if target_var == 'DTR' else groups.sum(min_count=len(FORECAST_MONTHS))
+    return aggregate.where(groups.count().eq(len(FORECAST_MONTHS))).dropna(subset=['Fact']).reset_index()
+
+
 def generate_excel_reports(dataset_info):
     """Генерирует Excel-отчеты с 5 листами и 2 таблицами бок о бок."""
     print(f"3. Генерация Excel-отчетов ({VALIDATION_PERIOD} гг.)...")
@@ -182,13 +191,7 @@ def generate_excel_reports(dataset_info):
                 monthly_table = monthly_avg[cols_monthly]
 
                 # Правая таблица: Годовые значения
-                agg_func = 'mean' if var == 'DTR' else 'sum'
-                annual_avg = monthly_avg.groupby('Year').agg({
-                    'Fact': agg_func,
-                    'Random Forest': agg_func,
-                    'K-Neighbors': agg_func,
-                    'MLP Neural Network': agg_func
-                }).reset_index()
+                annual_avg = aggregate_annual_forecasts(monthly_avg, ['Year'], var)
                 
                 annual_avg = annual_avg.sort_values('Year').reset_index(drop=True)
                 cols_annual = ['Year', 'Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network']
@@ -295,7 +298,7 @@ def calculate_and_save_metrics(raw_datasets):
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("========================================================================\n")
-        f.write(f"СУММАРНЫЕ СТАТИСТИЧЕСКИЕ МЕТРИКИ ТОЧНОСТИ МОДЕЛЕЙ ({VALIDATION_PERIOD} гг.)\n")
+        f.write(f"МЕТРИКИ ПРЯМОГО ПРОГНОЗА НА 12 МЕСЯЦЕВ ({VALIDATION_PERIOD} гг., ежегодное переобучение)\n")
         f.write("========================================================================\n\n")
 
         for key, info in raw_datasets.items():
@@ -375,13 +378,7 @@ def generate_map_atlas(dataset_info):
             # 1. Готовим данные среза для всех моделей и факта
             if is_annual:
                 # Годовая агрегация для каждой станции
-                agg_func = 'mean' if var == 'DTR' else 'sum'
-                df_slice = df_target_year.groupby(['WMO', 'Latitude', 'Longitude']).agg({
-                    'Fact': agg_func,
-                    'Random Forest': agg_func,
-                    'K-Neighbors': agg_func,
-                    'MLP Neural Network': agg_func
-                }).reset_index()
+                df_slice = aggregate_annual_forecasts(df_target_year, ['WMO', 'Latitude', 'Longitude'], var)
                 slice_name = "Год"
                 title_time = f"Годовой срез {VALIDATION_END_YEAR} г."
             else:
@@ -544,7 +541,7 @@ def main():
         
         print(f"   Загрузка {config['path'].name}...")
         try:
-            df_raw = read_prediction_csv(config['path'], config['dataset'])
+            df_raw = read_validation_csv(config['path'], config['dataset'])
         except ValueError as error:
             print(error)
             return
