@@ -219,18 +219,27 @@ class BaseVisualizer:
             print(f"    Ошибка рисования {filename_base}: {e}")
 
     def _plot_full_graph(self, df, dataset, var, year_info, filename):
-        actuals = df.groupby('Date')['Fact'].mean()
+        models = df['Model'].dropna().unique()
+        station_keys = ['Date', 'WMO']
+        paired = df.dropna(subset=['Fact', 'Forecast'])
+        station_forecasts = paired.pivot_table(
+            index=station_keys, columns='Model', values='Forecast', observed=True,
+        )
+        # Состав станций должен быть общим для всех линий за каждый месяц.
+        common_stations = station_forecasts.reindex(columns=models).dropna()
+        station_facts = paired.groupby(station_keys, observed=True)['Fact'].first()
+        monthly = common_stations.join(station_facts).groupby(level='Date').mean()
+        dates = pd.date_range(df['Date'].min(), df['Date'].max(), freq='MS')
+        monthly = monthly.reindex(dates)
+
         plt.figure(figsize=(12, 6))
-        
-        plt.plot(actuals.index, actuals.values, label='Фактические данные', color='black', linewidth=3, marker='o')
-        
-        models = df['Model'].unique()
-        for m in models:
-            preds = df[df['Model'] == m].groupby('Date')['Forecast'].mean()
-            a, p = actuals.align(preds, join='inner')
-            if not a.empty:
-                ru_model = RU_TITLES.get(m, m)
-                plt.plot(p.index, p.values, label=ru_model, linestyle='--', linewidth=2, color=MODEL_COLORS.get(m))
+
+        plt.plot(dates, monthly['Fact'], label=RU_TITLES['Fact'], color='black', linewidth=3, marker='o')
+        for model in models:
+            plt.plot(
+                dates, monthly[model], label=RU_TITLES.get(model, model),
+                linestyle='--', linewidth=2, color=MODEL_COLORS.get(model),
+            )
         
         ru_var = RU_TITLES.get(var, var)
         ru_dataset = RU_TITLES.get(dataset, dataset)
@@ -293,12 +302,13 @@ class ValidationVisualizer(BaseVisualizer):
             try:
                 df = read_validation_csv(f, dataset)
                 df['Date'] = pd.to_datetime(df['Date'])
-                df = df.loc[df['Date'].dt.year.between(start_year, end_year)].dropna(subset=['Forecast', 'Fact'])
+                df = df.loc[df['Date'].dt.year.between(start_year, end_year)]
                 if df.empty:
                     continue
                 
                 self._plot_full_graph(df, dataset, var, f"Прямой прогноз на 12 мес., {years_range}", f"ValidGraph_{dataset}_{var}")
-                
+
+                df = df.dropna(subset=['Forecast', 'Fact'])
                 for model in df['Model'].unique():
                     df_mod = df[df['Model'] == model]
                     metrics = self._calculate_metrics(df_mod, var)
