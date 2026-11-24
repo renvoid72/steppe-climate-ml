@@ -140,6 +140,15 @@ class LSTMCalendarWindowsTest(unittest.TestCase):
                         windows[is_target, :, :2], [expected[columns].to_numpy()]
                     )
 
+    def test_annual_lstm_can_forecast_before_january_observation_exists(self):
+        history = self.source.loc[self.source['Date'] < '2024-01-01']
+        for data in (history, self.source):
+            with self.subTest(has_future=len(data) > len(history)):
+                windows, _, dates, stations, _, _ = self.engine._build_sequences(data, 'DTR', annual=True)
+                january = dates == np.datetime64('2024-01-01')
+                np.testing.assert_array_equal(stations[january], ['A', 'B'])
+                np.testing.assert_array_equal(windows[january, -1, 0], [21., 111.])
+
     def test_lstm_requires_only_the_selected_target_and_complete_history(self):
         gap_date = pd.Timestamp('2024-01-01')
         data = self.source.loc[self.source['WMO'] == 'B'].copy()

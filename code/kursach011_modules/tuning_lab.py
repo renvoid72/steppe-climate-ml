@@ -24,11 +24,11 @@ import random
 
 if __package__:
     from .meteo_data import load_monthly_meteo
-    from .monthly_features import create_forecast_features, model_feature_columns, select_model_rows
+    from .monthly_features import prepare_forecast_period, model_feature_columns, select_model_rows
     from .project_settings import ANALYSIS_YEAR, cru_csv_path
 else:
     from meteo_data import load_monthly_meteo
-    from monthly_features import create_forecast_features, model_feature_columns, select_model_rows
+    from monthly_features import prepare_forecast_period, model_feature_columns, select_model_rows
     from project_settings import ANALYSIS_YEAR, cru_csv_path
 
 warnings.filterwarnings('ignore')
@@ -121,6 +121,10 @@ def tune_model(dataset_name, target_var, test_years):
         'MLP Neural Network': MLPRegressor
     }
     
+    forecast_dates = [pd.Timestamp(year, month, 1) for year in sorted(test_years) for month in range(1, 13)]
+    history, forecast_rows = prepare_forecast_period(df_full, forecast_dates)
+    train_rows = select_model_rows(history, target_var)
+    eligible_forecasts = select_model_rows(forecast_rows)
     for model_name, reg_class in model_classes.items():
         print(f"\n>>> Модель: {model_name} <<<")
         
@@ -138,45 +142,41 @@ def tune_model(dataset_name, target_var, test_years):
             
             try:
                 # Walk-Forward Loop
-                for year in sorted(test_years):
-                    for month in range(1, 13):
-                        forecast_date = pd.to_datetime(f"{year}-{month}-01")
+                for forecast_date in forecast_dates:
+                    df_train = train_rows.loc[train_rows['Date'] < forecast_date]
+                    df_pred = eligible_forecasts.loc[eligible_forecasts['Date'] == forecast_date]
+                    facts = actuals[actuals['Date'] == forecast_date].set_index('WMO')[target_var]
+                    df_pred = df_pred[df_pred['WMO'].isin(facts.index)]
 
-                        df_features = create_forecast_features(df_full, forecast_date)
-                        df_train = select_model_rows(df_features[df_features['Date'] < forecast_date], target_var)
-                        df_pred = select_model_rows(df_features[df_features['Date'] == forecast_date])
-                        facts = actuals[actuals['Date'] == forecast_date].set_index('WMO')[target_var]
-                        df_pred = df_pred[df_pred['WMO'].isin(facts.index)]
+                    if df_pred.empty or len(df_train) < params.get('n_neighbors', 1):
+                        continue
 
-                        if df_pred.empty or len(df_train) < params.get('n_neighbors', 1):
-                            continue
+                    model_args = {'random_state': 42} if 'Random' in model_name or 'MLP' in model_name else {}
+                    if 'Random' in model_name or 'Neighbors' in model_name: model_args['n_jobs'] = -1
 
-                        model_args = {'random_state': 42} if 'Random' in model_name or 'MLP' in model_name else {}
-                        if 'Random' in model_name or 'Neighbors' in model_name: model_args['n_jobs'] = -1
-                        
-                        feature_cols = model_feature_columns(df_train)
+                    feature_cols = model_feature_columns(df_train)
 
-                        model = reg_class(**params, **model_args)
-                        scaler = StandardScaler().fit(df_train[feature_cols])
-                        
-                        # Логарифмирование для осадков (ОБЯЗАТЕЛЬНО для регрессии)
-                        if target_var == 'Precip':
-                            y_train = np.log1p(df_train[target_var])
-                        else:
-                            y_train = df_train[target_var]
-                            
-                        model.fit(scaler.transform(df_train[feature_cols]), y_train)
-                        
-                        raw_preds = model.predict(scaler.transform(df_pred[feature_cols]))
-                        
-                        # Обратное преобразование
-                        if target_var == 'Precip':
-                            val = np.mean(np.expm1(raw_preds))
-                        else:
-                            val = np.mean(raw_preds)
-                        
-                        all_preds.append(max(0, val))
-                        all_facts.append(facts.loc[df_pred['WMO']].mean())
+                    model = reg_class(**params, **model_args)
+                    scaler = StandardScaler().fit(df_train[feature_cols])
+
+                    # Логарифмирование для осадков (ОБЯЗАТЕЛЬНО для регрессии)
+                    if target_var == 'Precip':
+                        y_train = np.log1p(df_train[target_var])
+                    else:
+                        y_train = df_train[target_var]
+
+                    model.fit(scaler.transform(df_train[feature_cols]), y_train)
+
+                    raw_preds = model.predict(scaler.transform(df_pred[feature_cols]))
+
+                    # Обратное преобразование
+                    if target_var == 'Precip':
+                        val = np.mean(np.expm1(raw_preds))
+                    else:
+                        val = np.mean(raw_preds)
+
+                    all_preds.append(max(0, val))
+                    all_facts.append(facts.loc[df_pred['WMO']].mean())
 
                 if all_preds:
                     r2 = r2_score(all_facts, all_preds) if len(all_preds) > 1 else np.nan

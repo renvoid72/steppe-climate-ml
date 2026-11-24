@@ -11,7 +11,7 @@ from pathlib import Path
 import warnings
 import os
 
-from .forecast_engine import read_prediction_csv
+from .forecast_engine import read_prediction_csv, read_validation_csv
 from .project_settings import (
     ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, forecast_filename, validation_filename,
 )
@@ -283,7 +283,7 @@ class ValidationVisualizer(BaseVisualizer):
         super().__init__(base_dir, results_dir, "validation_results")
 
     def run(self, start_year=VALIDATION_START_YEAR, end_year=VALIDATION_END_YEAR):
-        print("\n--- [Viz] Валидация (Карты за весь период) ---")
+        print("\n--- [Viz] Прямой прогноз на 12 месяцев (Карты за весь период оценки) ---")
         years_range = f'{start_year}-{end_year}'
         for dataset, var in product(DATASETS, TARGETS):
             f = self.csv_dir / validation_filename(dataset, var, start_year, end_year)
@@ -291,13 +291,13 @@ class ValidationVisualizer(BaseVisualizer):
                 continue
             print(f"  Обработка: {f.name}...")
             try:
-                df = read_prediction_csv(f, dataset)
+                df = read_validation_csv(f, dataset)
                 df['Date'] = pd.to_datetime(df['Date'])
-                df = df.loc[df['Date'].dt.year.between(start_year, end_year)]
+                df = df.loc[df['Date'].dt.year.between(start_year, end_year)].dropna(subset=['Forecast', 'Fact'])
                 if df.empty:
                     continue
                 
-                self._plot_full_graph(df, dataset, var, f"Период {years_range}", f"ValidGraph_{dataset}_{var}")
+                self._plot_full_graph(df, dataset, var, f"Прямой прогноз на 12 мес., {years_range}", f"ValidGraph_{dataset}_{var}")
                 
                 for model in df['Model'].unique():
                     df_mod = df[df['Model'] == model]

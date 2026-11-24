@@ -6,12 +6,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 
+from kursach011_modules.annual_forecast import ANNUAL_FORECAST_MODE, prepare_annual_features
 from kursach011_modules.forecast_engine import (
-    CRU_SOURCE_VERSION, LongTermValidator, StandardForecaster, read_prediction_csv,
+    CRU_SOURCE_VERSION, LongTermValidator, StandardForecaster, read_prediction_csv, read_validation_csv,
 )
-from kursach011_modules.monthly_features import create_forecast_features, select_model_rows
+from kursach011_modules.monthly_features import create_forecast_features, prepare_forecast_period, select_model_rows
+from kursach011_modules.project_settings import validation_filename
 
 
 class ForecastHistoryTest(unittest.TestCase):
@@ -52,6 +55,21 @@ class ForecastHistoryTest(unittest.TestCase):
         self.assertEqual(select_model_rows(future).index.tolist(), ['A'])
         self.assertEqual(future.loc['A', 'Precip_lag_1'], 0.0)
         self.assertTrue(select_model_rows(future, 'DTR').empty)
+
+    def test_period_matches_individual_cutoffs_with_new_stations_and_missing_months(self):
+        dates = pd.date_range('2023-11-01', periods=5, freq='MS')
+        history, candidates = prepare_forecast_period(self.source, dates)
+        for date in dates:
+            with self.subTest(date=date):
+                expected = create_forecast_features(self.source, date)
+                for actual, reference in (
+                    (history.loc[history['Date'] < date], expected.loc[expected['Date'] < date]),
+                    (candidates.loc[candidates['Date'] == date], expected.loc[expected['Date'] == date]),
+                ):
+                    pd.testing.assert_frame_equal(
+                        actual.reset_index(drop=True), reference.reset_index(drop=True),
+                        check_exact=True, check_dtype=False,
+                    )
 
     def test_meteo_keeps_one_known_indicator_for_targets_and_lags(self):
         base_dir = Path(self.output_dir)
@@ -115,19 +133,63 @@ class ForecastHistoryTest(unittest.TestCase):
         with patch.object(forecaster, 'load_data', side_effect=AssertionError('CSV cache was ignored')):
             forecaster.run(2024, 'CRU_CEDA')
 
-    def test_validation_evaluates_only_eligible_rows(self):
+    def test_validation_forecasts_full_year_and_trains_only_on_completed_years(self):
         validator = LongTermValidator(self.output_dir, self.output_dir)
-        self.use_knn(validator)
+        validator.model_classes = {'Random Forest': validator.model_classes['Random Forest']}
+        dates = pd.date_range('2020-01-01', '2025-12-01', freq='MS')
+        data = pd.DataFrame({
+            'Date': dates, 'WMO': 'A', 'Latitude': 45.0, 'Longitude': 60.0,
+            'DTR': dates.year * 100. + dates.month, 'Precip': dates.month - 1.,
+            'Year': dates.year, 'Month': dates.month,
+        })
+        data = pd.concat([data, data.loc[data['Date'] != '2024-06-01'].assign(WMO='B')])
+        old_file = validator.output_dir / 'Validation_CRU_CEDA_DTR_2024-2025.csv'
+        legacy = data.iloc[:1].assign(
+            Forecast=10.0, Fact=10.0, Model='Random Forest', Target_Var='DTR',
+            History_Policy='complete_features', Source_Version=CRU_SOURCE_VERSION,
+        )
+        legacy.to_csv(old_file, index=False)
+        with self.assertRaisesRegex(ValueError, 'пересчитайте валидацию'):
+            read_validation_csv(old_file, 'CRU_CEDA')
 
-        output_text = self.run_with_cp1251_stdout(validator.run, 2024, 'CRU_CEDA', end_year=2024)
+        changed = data.copy()
+        changed.loc[changed['Year'] >= 2024, ['DTR', 'Precip']] = 999.
+        before = prepare_annual_features(data, 2025).loc[lambda rows: rows['Date'].dt.year == 2024]
+        after = prepare_annual_features(changed, 2025).loc[lambda rows: rows['Date'].dt.year == 2024]
+        pd.testing.assert_frame_equal(before, after, check_exact=True)
 
-        self.assertEqual(output_text.count(
-            'кандидатов: 4, допущено: 1, исключено: 3, прогнозов: 1, пар с фактом: 1'
-        ), 2)
-        self.assertIn('R2=', output_text)
-        results = pd.read_csv(validator.output_dir / 'Validation_CRU_CEDA_Precip_2024-2024.csv')
-        self.assertEqual(results['WMO'].tolist(), ['A'])
-        self.assertEqual(results['Fact'].tolist(), [0.0])
+        def predict(train, test, model_name, target_var, dataset_name, *, y_train):
+            year = test['Date'].dt.year.unique().item()
+            self.assertTrue((train['Date'].dt.year < year).all())
+            months = np.tile(np.arange(1, 13), (len(train), 1))
+            offset = train['Date'].dt.year.to_numpy()[:, None] * 100 if target_var == 'DTR' else -1
+            np.testing.assert_array_equal(y_train, months + offset)
+            years_and_stations = set(zip(train['Date'].dt.year, train['WMO']))
+            self.assertEqual((2024, 'A') in years_and_stations, year == 2025)
+            self.assertNotIn((2024, 'B'), years_and_stations)
+            self.assertTrue(test[target_var].isna().all())
+            return np.tile(np.arange(1.0, 13.0), (len(test), 1))
+
+        with (
+            patch.object(validator, 'load_data', return_value=data),
+            patch.object(validator, '_fit_predict_model', side_effect=predict) as fit_predict,
+        ):
+            output = self.run_with_cp1251_stdout(validator.run, 2024, 'CRU_CEDA', end_year=2025)
+        self.assertEqual(fit_predict.call_count, 4)
+        self.assertIn('Месячных прогнозов: 48, пар с фактом: 47', output)
+        results = pd.read_csv(
+            validator.output_dir / validation_filename('CRU_CEDA', 'Precip', 2024, 2025),
+            parse_dates=['Date'],
+        )
+        self.assertEqual(results.groupby(['WMO', results['Date'].dt.year]).size().tolist(), [12] * 4)
+        self.assertTrue(results.loc[results['Fact'].isna(), 'Date'].eq('2024-06-01').item())
+        np.testing.assert_array_equal(results['Forecast'], results['Date'].dt.month)
+        replaced = read_validation_csv(old_file, 'CRU_CEDA')
+        self.assertEqual(len(replaced), 48)
+        self.assertTrue(validator._is_file_valid(old_file.name, 'CRU_CEDA'))
+        mixed = pd.concat([replaced, legacy], ignore_index=True)
+        mixed.to_csv(old_file, index=False)
+        self.assertFalse(validator._is_file_valid(old_file.name, 'CRU_CEDA'))
 
     def test_standard_forecast_handles_a_year_with_no_history(self):
         forecaster = StandardForecaster(self.output_dir, self.output_dir)
@@ -141,7 +203,7 @@ class ForecastHistoryTest(unittest.TestCase):
 
     def test_cru_cache_requires_current_source_version(self):
         validator = LongTermValidator(self.output_dir, self.output_dir)
-        filename = 'Validation_CRU_CEDA_DTR_1990-2020.csv'
+        filename = validation_filename('CRU_CEDA', 'DTR')
         output = validator.output_dir / filename
         forecast = self.source.iloc[:1].assign(
             Forecast=10.0, Fact=10.0, Model='K-Neighbors', Target_Var='DTR',
@@ -176,6 +238,8 @@ class ForecastHistoryTest(unittest.TestCase):
                 visualizer = visualize.__new__(visualize)
                 visualizer.csv_dir = Path(self.output_dir)
                 records = forecast.assign(Date=f'{year}-01-01')
+                if visualize is ValidationVisualizer:
+                    records = records.assign(Forecast_Mode=ANNUAL_FORECAST_MODE)
                 for dataset in ('METEO_RU', 'CRU_CEDA'):
                     name = pattern.format(dataset=dataset, variable='DTR', period=period)
                     records.to_csv(visualizer.csv_dir / name, index=False)
@@ -183,6 +247,9 @@ class ForecastHistoryTest(unittest.TestCase):
                 records.to_csv(visualizer.csv_dir / old_period, index=False)
                 old_cru = pattern.format(dataset='CRU_CEDA', variable='Precip', period=period)
                 records.assign(Source_Version='CRU TS 4.06').to_csv(visualizer.csv_dir / old_cru, index=False)
+                if visualize is ValidationVisualizer:
+                    legacy = pattern.format(dataset='METEO_RU', variable='Precip', period=period)
+                    records.drop(columns='Forecast_Mode').to_csv(visualizer.csv_dir / legacy, index=False)
 
                 with (
                     patch.object(visualizer, '_plot_full_graph') as graph,

@@ -21,7 +21,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from kursach011_modules.project_settings import VALIDATION_PERIOD, results_dir, validation_filename
-from kursach011_modules.forecast_engine import read_prediction_csv
+from kursach011_modules.forecast_engine import read_validation_csv
 
 warnings.filterwarnings('ignore')
 
@@ -117,8 +117,8 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
                 )
             
             print(f"   Обработка параметра {param}...")
-            df_meteo = pd.read_csv(paths['meteo'])
-            df_cru = read_prediction_csv(paths['cru'], 'CRU_CEDA')
+            df_meteo = read_validation_csv(paths['meteo'], 'METEO_RU')
+            df_cru = read_validation_csv(paths['cru'], 'CRU_CEDA')
             
             # Обеспечиваем типы данных для корректного слияния
             df_meteo['WMO'] = df_meteo['WMO'].astype(int)

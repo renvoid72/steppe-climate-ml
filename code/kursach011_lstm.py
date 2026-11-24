@@ -22,6 +22,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
+from kursach011_modules.annual_forecast import (
+    ANNUAL_FORECAST_MODE, annual_prediction_rows, annual_splits, annual_targets, print_monthly_errors,
+)
 from kursach011_modules.forecast_engine import mark_prediction_source
 from kursach011_modules.project_settings import (
     ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR,
@@ -84,7 +87,7 @@ class ClimateLSTM(nn.Module):
     Глубокая рекуррентная нейросеть LSTM для временных рядов климатических показателей.
     Состоит из 2 слоев LSTM с Dropout и полносвязной регрессионной головки (MLP Head).
     """
-    def __init__(self, input_dim, hidden_dim=64, num_layers=2, dropout=0.2):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2, dropout=0.2, output_dim=1):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_dim,
@@ -97,7 +100,7 @@ class ClimateLSTM(nn.Module):
             nn.Linear(hidden_dim, 32),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(32, 1)
+            nn.Linear(32, output_dim)
         )
 
     def forward(self, x):
@@ -156,8 +159,8 @@ class LSTMFORECASTENGINE:
         df['Month_cos'] = np.cos(2 * np.pi * df['Date'].dt.month / 12)
         return df
 
-    def _build_sequences(self, df, target_var):
-        """Формирует полные входные окна из непрерывных месяцев с известной целью."""
+    def _build_sequences(self, df, target_var, *, annual=False):
+        """Формирует входные окна, для годового прогноза заканчивает их декабрём."""
         df = self._prepare_features_df(df.sort_values(['WMO', 'Date']))
         
         # Подготовка признаков: целевая + ко-переменная + календарь + координаты
@@ -197,23 +200,36 @@ class LSTMFORECASTENGINE:
             w_lats = lat_all[mask]
             w_lons = lon_all[mask]
 
-            n_records = len(w_feats)
-            if n_records <= self.lookback:
-                continue
-
-            # Проверяем все переходы от начала окна до целевого месяца.
-            consecutive_months = np.diff(months_all[mask]) == 1
-            steps = np.lib.stride_tricks.sliding_window_view(consecutive_months, self.lookback)
-            for i in np.flatnonzero(steps.all(axis=1)) + self.lookback:
-                history = w_feats[i - self.lookback:i]
-                if not np.isfinite(w_targets[i]) or not np.isfinite(history).all():
+            w_months = months_all[mask]
+            if annual:
+                # Последний месяц признаков — декабрь. Наличие будущего января не требуется.
+                cutoffs = np.flatnonzero(w_months[self.lookback - 1:] % 12 == 0) + self.lookback
+            else:
+                if len(w_feats) <= self.lookback:
                     continue
+                steps = np.lib.stride_tricks.sliding_window_view(np.diff(w_months) == 1, self.lookback)
+                cutoffs = np.flatnonzero(steps.all(axis=1)) + self.lookback
+
+            for i in cutoffs:
+                history = w_feats[i - self.lookback:i]
+                if not np.isfinite(history).all():
+                    continue
+                if annual:
+                    if not (np.diff(w_months[i - self.lookback:i]) == 1).all():
+                        continue
+                    date = pd.Timestamp(w_dates[i - 1]) + pd.offsets.MonthBegin()
+                    coord_index = i - 1
+                    target = np.nan  # Годовые цели присоединяются отдельно.
+                else:
+                    if not np.isfinite(w_targets[i]):
+                        continue
+                    date, coord_index, target = w_dates[i], i, w_targets[i]
                 X_list.append(history)
-                y_list.append(w_targets[i])
-                date_list.append(w_dates[i])
+                y_list.append(target)
+                date_list.append(date)
                 wmo_list.append(w)
-                lat_list.append(w_lats[i])
-                lon_list.append(w_lons[i])
+                lat_list.append(w_lats[coord_index])
+                lon_list.append(w_lons[coord_index])
 
         X_arr = np.array(X_list, dtype=np.float32).reshape(-1, self.lookback, features_raw.shape[1])
         y_arr = np.array(y_list, dtype=np.float32)
@@ -240,7 +256,8 @@ class LSTMFORECASTENGINE:
         # Преобразование целевой переменной
         y_train_proc = np.log1p(y_train) if target_var == 'Precip' else y_train.copy()
         y_scaler = StandardScaler()
-        y_train_scaled = y_scaler.fit_transform(y_train_proc.reshape(-1, 1)).flatten()
+        y_matrix = y_train_proc.reshape(N, -1)
+        y_train_scaled = y_scaler.fit_transform(y_matrix).reshape(y_train.shape)
 
         # Создание DataLoader
         tensor_x = torch.tensor(X_train_scaled, dtype=torch.float32)
@@ -249,7 +266,7 @@ class LSTMFORECASTENGINE:
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
 
         # Модель
-        model = ClimateLSTM(input_dim=n_feat, hidden_dim=64, num_layers=2, dropout=0.2).to(self.device)
+        model = ClimateLSTM(input_dim=n_feat, output_dim=y_matrix.shape[1]).to(self.device)
         criterion = nn.HuberLoss(delta=1.0)
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.005, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -280,7 +297,7 @@ class LSTMFORECASTENGINE:
             raw_out = model(tensor_x).cpu().numpy()
 
         # Обратная денормализация
-        pred_scaled = y_scaler.inverse_transform(raw_out.reshape(-1, 1)).flatten()
+        pred_scaled = y_scaler.inverse_transform(raw_out.reshape(N, -1)).reshape(raw_out.shape)
         if target_var == 'Precip':
             preds = np.expm1(pred_scaled)
         else:
@@ -293,7 +310,8 @@ class LSTMFORECASTENGINE:
     # ==========================================================================
     def run_standard_forecast(self, target_year, dataset_name):
         print("\n" + "="*80)
-        print(f" БЛОК 1: СТАНДАРТНЫЙ ПРОГНОЗ ({dataset_name} | Год прогноза: {target_year})")
+        print(f" БЛОК 1: ПРОГНОЗ НА МЕСЯЦ ({dataset_name} | Период оценки: {target_year})")
+        print(" Переобучение ежемесячно")
         print("="*80)
 
         t_load_start = time.perf_counter()
@@ -408,7 +426,8 @@ class LSTMFORECASTENGINE:
     # ==========================================================================
     def run_validation(self, split_year, dataset_name, end_year=VALIDATION_END_YEAR):
         print("\n" + "="*80)
-        print(f" БЛОК 2: ДОЛГОСРОЧНАЯ ВАЛИДАЦИЯ ({dataset_name} | Период: {split_year}-{end_year})")
+        print(f" БЛОК 2: ПРЯМОЙ ПРОГНОЗ НА 12 МЕСЯЦЕВ ({dataset_name} | Период оценки: {split_year}-{end_year})")
+        print(" Переобучение ежегодно")
         print("="*80)
 
         t_load_start = time.perf_counter()
@@ -422,93 +441,64 @@ class LSTMFORECASTENGINE:
         data_max_year = df_full['Year'].max()
         final_year = min(end_year, data_max_year)
         test_years = list(range(split_year, final_year + 1))
+        if not test_years:
+            return
 
+        history = df_full.loc[df_full['Year'] < final_year]
         VAL_CSV_DIR.mkdir(parents=True, exist_ok=True)
         for target_var in ['DTR', 'Precip']:
             fname = validation_filename(dataset_name, target_var, split_year, final_year)
             print(f"\n---> Параметр: {target_var} <---")
             print(f"\n  * Модель: LSTM Neural Network")
 
-            # Формируем все окна
-            X_all, y_all, dates_all, wmo_all, lats_all, lons_all = self._build_sequences(df_full, target_var)
-            dates_dt = pd.to_datetime(dates_all)
+            X_all, _, dates, wmo, lat, lon = self._build_sequences(history, target_var, annual=True)
+            anchors = pd.DataFrame({'Date': dates, 'WMO': wmo, 'Latitude': lat, 'Longitude': lon})
+            targets = annual_targets(df_full, anchors, target_var).astype(np.float32)
 
-            all_res_rows = []
+            results = []
             total_fit_time = 0.0
             total_pred_time = 0.0
-            total_samples = 0
-            all_preds = []
-            all_facts = []
 
-            # Годовой Expanding Walk-Forward
-            for year in test_years:
-                split_date = pd.to_datetime(f"{year}-01-01")
-                next_year_date = pd.to_datetime(f"{year + 1}-01-01")
-
-                train_mask = (dates_dt < split_date)
-                test_mask = (dates_dt >= split_date) & (dates_dt < next_year_date)
-
+            for train_mask, test_mask in annual_splits(anchors, targets, test_years):
                 if not np.any(train_mask) or not np.any(test_mask):
                     continue
 
-                X_train, y_train = X_all[train_mask], y_all[train_mask]
-                X_test, y_test = X_all[test_mask], y_all[test_mask]
-                test_dates = dates_all[test_mask]
-                test_wmo = wmo_all[test_mask]
-                test_lat = lats_all[test_mask]
-                test_lon = lons_all[test_mask]
-
-                # 1. Обучение сети
                 t_fit_start = time.perf_counter()
-                model, feat_scaler, y_scaler = self._train_lstm_model(X_train, y_train, target_var, epochs=15)
-                t_fit_end = time.perf_counter()
-                fit_t = t_fit_end - t_fit_start
+                model, feat_scaler, y_scaler = self._train_lstm_model(
+                    X_all[train_mask], targets[train_mask], target_var, epochs=15,
+                )
+                total_fit_time += time.perf_counter() - t_fit_start
 
-                # 2. Инференс
                 t_pred_start = time.perf_counter()
-                preds = self._predict_lstm(model, feat_scaler, y_scaler, X_test, target_var)
-                t_pred_end = time.perf_counter()
-                pred_t = t_pred_end - t_pred_start
+                preds = self._predict_lstm(model, feat_scaler, y_scaler, X_all[test_mask], target_var)
+                total_pred_time += time.perf_counter() - t_pred_start
+                results.append(annual_prediction_rows(
+                    anchors.loc[test_mask], preds, targets[test_mask], 'LSTM Neural Network', target_var,
+                ))
 
-                total_fit_time += fit_t
-                total_pred_time += pred_t
-                total_samples += len(preds)
-
-                all_preds.extend(preds)
-                all_facts.extend(y_test)
-
-                # Запись строк
-                for i in range(len(preds)):
-                    d_val = pd.to_datetime(test_dates[i]).strftime('%Y-%m-%d')
-                    all_res_rows.append({
-                        'Date': d_val,
-                        'WMO': test_wmo[i],
-                        'Latitude': test_lat[i],
-                        'Longitude': test_lon[i],
-                        'Forecast': round(float(preds[i]), 4),
-                        'Fact': round(float(y_test[i]), 4),
-                        'Model': 'LSTM Neural Network',
-                        'Target_Var': target_var
-                    })
-
-            # Итоговые метрики за 30 лет
-            clean_facts = np.array(all_facts)
-            clean_preds = np.array(all_preds)
+            df_out = pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=FORECAST_COLUMNS)
+            paired = df_out.dropna(subset=['Fact'])
+            if not df_out.empty:
+                print_monthly_errors(paired)
+            clean_facts = paired['Fact'].to_numpy()
+            clean_preds = paired['Forecast'].to_numpy()
             r2 = r2_score(clean_facts, clean_preds) if clean_facts.size > 1 else np.nan
             mae = mean_absolute_error(clean_facts, clean_preds) if clean_facts.size else np.nan
             rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if clean_facts.size else np.nan
 
-            speed_samples_sec = total_samples / total_pred_time if total_pred_time > 0 else 0.0
+            speed_samples_sec = len(df_out) / total_pred_time if total_pred_time > 0 else 0.0
             total_time = total_fit_time + total_pred_time
 
             print(f"    - Время обучения (Fit Time):      {total_fit_time:.4f} сек")
             print(f"    - Время прогноза (Predict Time):  {total_pred_time:.4f} сек")
             print(f"    - Суммарное время (Total Time):   {total_time:.4f} сек")
-            print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_pred_time/(len(test_years)*12):.4f} сек/месяц)")
+            print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_pred_time/len(test_years):.4f} сек/год)")
             print(f"    - Метрики точности:               R² = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
+            print(f"    - Месячных прогнозов: {len(df_out)}, пар с фактом: {len(paired)}")
 
             # Сохранение CSV
-            df_out = pd.DataFrame(all_res_rows, columns=FORECAST_COLUMNS)
+            df_out = df_out.reindex(columns=FORECAST_COLUMNS).round({'Forecast': 4, 'Fact': 4})
+            df_out['Forecast_Mode'] = ANNUAL_FORECAST_MODE
             mark_prediction_source(df_out, dataset_name)
             df_out.to_csv(VAL_CSV_DIR / fname, index=False)
 
@@ -571,7 +561,7 @@ def main():
     # 2. Инициализация движка
     engine = LSTMFORECASTENGINE(base_dir=PROJECT_DIR, lookback_window=12)
 
-    # 3. Стандартный прогноз на 1 год
+    # 3. Стандартный прогноз на следующий месяц
     engine.run_standard_forecast(target_year=ANALYSIS_YEAR, dataset_name='METEO_RU')
     engine.run_standard_forecast(target_year=ANALYSIS_YEAR, dataset_name='CRU_CEDA')
 
