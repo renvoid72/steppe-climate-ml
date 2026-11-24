@@ -161,7 +161,7 @@ class LSTMFORECASTENGINE:
         return df
 
     def _build_sequences(self, df, target_var, *, annual=False):
-        """Формирует входные окна, для годового прогноза заканчивает их декабрём."""
+        """Формирует входные окна. Для годового прогноза последнее значение — декабрь."""
         df = self._prepare_features_df(df.sort_values(['WMO', 'Date']))
         
         # Подготовка признаков: целевая + ко-переменная + календарь + координаты
@@ -206,25 +206,24 @@ class LSTMFORECASTENGINE:
                 # Последний месяц признаков — декабрь. Наличие будущего января не требуется.
                 cutoffs = np.flatnonzero(w_months[self.lookback - 1:] % 12 == 0) + self.lookback
             else:
-                if len(w_feats) <= self.lookback:
+                if len(w_months) < self.lookback:
                     continue
-                steps = np.lib.stride_tricks.sliding_window_view(np.diff(w_months) == 1, self.lookback)
+                steps = np.lib.stride_tricks.sliding_window_view(np.diff(w_months) == 1, self.lookback - 1)
                 cutoffs = np.flatnonzero(steps.all(axis=1)) + self.lookback
 
             for i in cutoffs:
                 history = w_feats[i - self.lookback:i]
                 if not np.isfinite(history).all():
                     continue
-                if annual:
-                    if not (np.diff(w_months[i - self.lookback:i]) == 1).all():
-                        continue
+                if annual and not (np.diff(w_months[i - self.lookback:i]) == 1).all():
+                    continue
+                if not annual and i < len(w_months) and w_months[i] == w_months[i - 1] + 1:
+                    date, coord_index = w_dates[i], i
+                    target = w_targets[i] if np.isfinite(w_targets[i]) else np.nan
+                else:
                     date = pd.Timestamp(w_dates[i - 1]) + pd.offsets.MonthBegin()
                     coord_index = i - 1
-                    target = np.nan  # Годовые цели присоединяются отдельно.
-                else:
-                    if not np.isfinite(w_targets[i]):
-                        continue
-                    date, coord_index, target = w_dates[i], i, w_targets[i]
+                    target = np.nan
                 X_list.append(history)
                 y_list.append(target)
                 date_list.append(date)
@@ -331,6 +330,7 @@ class LSTMFORECASTENGINE:
 
             # Формируем все временные окна
             X_all, y_all, dates_all, wmo_all, lats_all, lons_all = self._build_sequences(df_full, target_var)
+            has_fact = np.isfinite(y_all)
 
             all_res_rows = []
             total_fit_time = 0.0
@@ -341,7 +341,7 @@ class LSTMFORECASTENGINE:
             for month_num in range(1, 13):
                 forecast_date = pd.to_datetime(f"{target_year}-{month_num:02d}-01")
 
-                train_mask = (dates_all < forecast_date)
+                train_mask = (dates_all < forecast_date) & has_fact
                 test_mask = (dates_all == forecast_date)
 
                 if not np.any(train_mask) or not np.any(test_mask):
@@ -361,7 +361,14 @@ class LSTMFORECASTENGINE:
 
                 # 2. Инференс прогноза
                 t_pred_start = time.perf_counter()
-                preds = self._predict_lstm(model, feat_scaler, y_scaler, X_test, target_var)
+                # Сохраняем состав батча, по которому рассчитываются метрики.
+                scored = has_fact[test_mask]
+                preds = np.empty(len(y_test), dtype=np.float32)
+                for batch in (scored, ~scored):
+                    if batch.any():
+                        preds[batch] = self._predict_lstm(
+                            model, feat_scaler, y_scaler, X_test[batch], target_var,
+                        ).reshape(-1)
                 t_pred_end = time.perf_counter()
                 pred_t = t_pred_end - t_pred_start
 
@@ -383,7 +390,8 @@ class LSTMFORECASTENGINE:
                     })
 
             df_out = pd.DataFrame(all_res_rows, columns=FORECAST_COLUMNS)
-            metrics = calculate_forecast_metrics(paired_predictions(df_out), target_var)
+            pairs = paired_predictions(df_out)
+            metrics = calculate_forecast_metrics(pairs, target_var)
 
             speed_samples_sec = total_samples / total_pred_time if total_pred_time > 0 else 0.0
             total_time = total_fit_time + total_pred_time
@@ -392,6 +400,7 @@ class LSTMFORECASTENGINE:
             print(f"    - Время прогноза (Predict Time):  {total_pred_time:.4f} сек")
             print(f"    - Суммарное время (Total Time):   {total_time:.4f} сек")
             print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_pred_time/12:.4f} сек/месяц)")
+            print(f"    - Месячных прогнозов: {len(df_out)}, пар с фактом: {len(pairs)}")
             print(format_forecast_metrics(metrics, padding='    '))
 
             # Сохранение CSV

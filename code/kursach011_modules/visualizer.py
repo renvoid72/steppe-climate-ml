@@ -12,6 +12,7 @@ import warnings
 import os
 
 from .forecast_engine import read_prediction_csv, read_validation_csv
+from .forecast_metrics import regional_forecast_summary
 from .project_settings import (
     ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, forecast_filename, validation_filename,
 )
@@ -220,17 +221,8 @@ class BaseVisualizer:
 
     def _plot_full_graph(self, df, dataset, var, year_info, filename):
         models = df['Model'].dropna().unique()
-        station_keys = ['Date', 'WMO']
-        paired = df.dropna(subset=['Fact', 'Forecast'])
-        station_forecasts = paired.pivot_table(
-            index=station_keys, columns='Model', values='Forecast', observed=True,
-        )
-        # Состав станций должен быть общим для всех линий за каждый месяц.
-        common_stations = station_forecasts.reindex(columns=models).dropna()
-        station_facts = paired.groupby(station_keys, observed=True)['Fact'].first()
-        monthly = common_stations.join(station_facts).groupby(level='Date').mean()
         dates = pd.date_range(df['Date'].min(), df['Date'].max(), freq='MS')
-        monthly = monthly.reindex(dates)
+        monthly = regional_forecast_summary(df, models).reindex(dates)
 
         plt.figure(figsize=(12, 6))
 
