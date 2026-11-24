@@ -23,7 +23,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from kursach011_modules.forecast_engine import read_validation_csv
-from kursach011_modules.forecast_metrics import calculate_forecast_metrics, format_forecast_metrics, paired_predictions
+from kursach011_modules.forecast_metrics import (
+    calculate_forecast_metrics, format_forecast_metrics, paired_predictions, regional_forecast_summary,
+)
 from kursach011_modules.annual_forecast import FORECAST_MONTHS
 from kursach011_modules.meteo_data import load_monthly_meteo
 from kursach011_modules.project_settings import (
@@ -36,6 +38,8 @@ warnings.filterwarnings('ignore')
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 RESULTS_DIR = results_dir(PROJECT_DIR)
 ANALYTICS_DIR = RESULTS_DIR / "analytics_reports"
+FORECAST_MODELS = ('Random Forest', 'K-Neighbors', 'MLP Neural Network')
+FORECAST_VALUE_COLUMNS = ['Fact', *FORECAST_MODELS]
 
 # Добавляем путь к коду в sys.path, чтобы импортировать BaseVisualizer
 sys.path.append(str(PROJECT_DIR / "code"))
@@ -123,7 +127,7 @@ def pivot_forecasts(forecasts):
     ).reset_index()
 
     # Проверка на наличие всех трех моделей
-    for model in ['Random Forest', 'K-Neighbors', 'MLP Neural Network']:
+    for model in FORECAST_MODELS:
         if model not in pivoted.columns:
             pivoted[model] = np.nan
 
@@ -134,8 +138,7 @@ def pivot_forecasts(forecasts):
 
 def aggregate_annual_forecasts(monthly, group_columns, target_var):
     """Считает годовые значения по полным 12-месячным рядам."""
-    columns = ['Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network']
-    groups = monthly.groupby(group_columns)[columns]
+    groups = monthly.groupby(group_columns)[FORECAST_VALUE_COLUMNS]
     aggregate = groups.mean() if target_var == 'DTR' else groups.sum(min_count=len(FORECAST_MONTHS))
     return aggregate.where(groups.count().eq(len(FORECAST_MONTHS))).dropna(subset=['Fact']).reset_index()
 
@@ -152,8 +155,13 @@ def generate_excel_reports(dataset_info):
         ('Дальний Восток', 'Дальний Восток')
     ]
 
-    for key, info in dataset_info.items():
-        pivoted_df = info['pivoted']
+    monthly_columns = ['Year', 'Month', *FORECAST_VALUE_COLUMNS, 'N_Stations']
+    for info in dataset_info.values():
+        raw = info['raw'].assign(Date=lambda rows: pd.to_datetime(rows['Date']))
+        raw['Region'] = raw['Longitude'].apply(get_macroregion)
+        present_models = set(raw['Model'].dropna())
+        models = [model for model in FORECAST_MODELS if model in present_models]
+        dates = pd.date_range(raw['Date'].min(), raw['Date'].max(), freq='MS') if not raw.empty else pd.DatetimeIndex([])
         var = info['var']
         dataset = info['dataset']
         
@@ -164,42 +172,18 @@ def generate_excel_reports(dataset_info):
         
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
             for sheet_name, region_name in regions_config:
-                if region_name is None:
-                    region_df = pivoted_df
-                else:
-                    region_df = pivoted_df[pivoted_df['Region'] == region_name]
-                
-                # Если в регионе нет станций
-                if region_df.empty:
-                    # Создаем пустые таблицы
-                    empty_monthly = pd.DataFrame(columns=['Year', 'Month', 'Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network'])
-                    empty_annual = pd.DataFrame(columns=['Year', 'Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network'])
-                    empty_monthly.to_excel(writer, sheet_name=sheet_name, startcol=0, index=False)
-                    empty_annual.to_excel(writer, sheet_name=sheet_name, startcol=7, index=False)
-                    continue
+                region_df = raw if region_name is None else raw.loc[raw['Region'] == region_name]
+                monthly = regional_forecast_summary(region_df, models)
+                if not region_df.empty:
+                    monthly = monthly.reindex(dates)
+                monthly['N_Stations'] = monthly['N_Stations'].fillna(0).astype(int)
+                monthly_table = monthly.assign(
+                    Year=monthly.index.year, Month=monthly.index.month,
+                ).reindex(columns=monthly_columns)
+                annual_table = aggregate_annual_forecasts(monthly_table, ['Year'], var)
 
-                # Левая таблица: Месячные значения (среднее по станциям региона)
-                monthly_avg = region_df.groupby(['Year', 'Month']).agg({
-                    'Fact': 'mean',
-                    'Random Forest': 'mean',
-                    'K-Neighbors': 'mean',
-                    'MLP Neural Network': 'mean'
-                }).reset_index()
-                
-                monthly_avg = monthly_avg.sort_values(['Year', 'Month']).reset_index(drop=True)
-                cols_monthly = ['Year', 'Month', 'Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network']
-                monthly_table = monthly_avg[cols_monthly]
-
-                # Правая таблица: Годовые значения
-                annual_avg = aggregate_annual_forecasts(monthly_avg, ['Year'], var)
-                
-                annual_avg = annual_avg.sort_values('Year').reset_index(drop=True)
-                cols_annual = ['Year', 'Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network']
-                annual_table = annual_avg[cols_annual]
-
-                # Записываем обе таблицы бок о бок (пропуская столбец G - index 6)
-                monthly_table.to_excel(writer, sheet_name=sheet_name, startcol=0, index=False)
-                annual_table.to_excel(writer, sheet_name=sheet_name, startcol=7, index=False)
+                monthly_table.to_excel(writer, sheet_name=sheet_name, index=False)
+                annual_table.to_excel(writer, sheet_name=sheet_name, startcol=len(monthly_columns) + 1, index=False)
 
     print("   -> Отчеты Excel успешно сохранены.")
 
@@ -266,7 +250,7 @@ def generate_fact_only_excel_reports(fact_datasets):
 
                     if region_df.empty:
                         empty_monthly = pd.DataFrame(columns=['Year', 'Month', 'Fact'])
-                        empty_annual = pd.DataFrame(columns=['Year', 'Fact'])
+                        empty_annual = pd.DataFrame(columns=['Year', 'Fact', 'N_Months'])
                         empty_monthly.to_excel(writer, sheet_name=sheet_name, startcol=0, index=False)
                         empty_annual.to_excel(writer, sheet_name=sheet_name, startcol=7, index=False)
                         continue
@@ -278,10 +262,14 @@ def generate_fact_only_excel_reports(fact_datasets):
                     monthly_table = monthly_avg[['Year', 'Month', 'Fact']]
 
                     # Правая таблица: Годовые значения факта
-                    agg_func = 'mean' if var == 'DTR' else 'sum'
-                    annual_avg = monthly_avg.groupby('Year')['Fact'].agg(agg_func).reset_index()
-                    annual_avg = annual_avg.sort_values('Year').reset_index(drop=True)
-                    annual_table = annual_avg[['Year', 'Fact']]
+                    groups = monthly_avg.groupby('Year')['Fact']
+                    count = groups.count().reindex(range(min_year, max_year + 1), fill_value=0)
+                    expected_months = len(FORECAST_MONTHS)
+                    annual = groups.mean() if var == 'DTR' else groups.sum(min_count=expected_months)
+                    annual_table = pd.DataFrame({
+                        'Fact': annual.where(count.eq(expected_months)),
+                        'N_Months': count,
+                    }).rename_axis('Year').reset_index()
 
                     # Записываем обе таблицы бок о бок (пропуская столбец G - index 6)
                     monthly_table.to_excel(writer, sheet_name=sheet_name, startcol=0, index=False)

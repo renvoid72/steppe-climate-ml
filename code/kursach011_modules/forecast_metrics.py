@@ -7,6 +7,19 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
+def regional_forecast_summary(predictions, models):
+    """Усредняет факт и прогнозы по общим станциям каждого месяца."""
+    station_keys = ['Date', 'WMO']
+    paired = predictions.dropna(subset=['Fact', 'Forecast'])
+    station_forecasts = paired.pivot_table(
+        index=station_keys, columns='Model', values='Forecast', observed=True,
+    )
+    common_stations = station_forecasts.reindex(columns=models).dropna()
+    station_facts = paired.groupby(station_keys, observed=True)['Fact'].first()
+    by_month = common_stations.join(station_facts).groupby(level='Date')
+    return by_month.mean().assign(N_Stations=by_month.size())
+
+
 def paired_predictions(predictions):
     """Оставляет датированные пары с известными фактом и прогнозом."""
     pairs = predictions[['Date', 'Fact', 'Forecast']].dropna()
