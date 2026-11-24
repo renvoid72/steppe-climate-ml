@@ -16,7 +16,6 @@ import warnings
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 import torch
 import torch.nn as nn
@@ -26,6 +25,7 @@ from kursach011_modules.annual_forecast import (
     ANNUAL_FORECAST_MODE, annual_prediction_rows, annual_splits, annual_targets, print_monthly_errors,
 )
 from kursach011_modules.forecast_engine import mark_prediction_source
+from kursach011_modules.forecast_metrics import calculate_forecast_metrics, format_forecast_metrics, paired_predictions
 from kursach011_modules.project_settings import (
     ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR,
     cru_csv_path, forecast_filename, results_dir, validation_filename,
@@ -121,6 +121,7 @@ class LSTMFORECASTENGINE:
         self.lookback = lookback_window # 12 месяцев истории
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.summary_table = []
+        self.accuracy_table = []
 
     def load_data(self, dataset_name):
         """Загрузка и базовая подготовка климатических данных."""
@@ -335,8 +336,6 @@ class LSTMFORECASTENGINE:
             total_fit_time = 0.0
             total_pred_time = 0.0
             total_samples = 0
-            all_preds = []
-            all_facts = []
 
             # Пошаговый помесячный Walk-Forward для 12 месяцев целевого года
             for month_num in range(1, 13):
@@ -370,9 +369,6 @@ class LSTMFORECASTENGINE:
                 total_pred_time += pred_t
                 total_samples += len(preds)
 
-                all_preds.extend(preds)
-                all_facts.extend(y_test)
-
                 # Сохранение результатов шага
                 for i in range(len(preds)):
                     all_res_rows.append({
@@ -380,18 +376,14 @@ class LSTMFORECASTENGINE:
                         'WMO': test_wmo[i],
                         'Latitude': test_lat[i],
                         'Longitude': test_lon[i],
-                        'Forecast': round(float(preds[i]), 4),
-                        'Fact': round(float(y_test[i]), 4),
+                        'Forecast': float(preds[i]),
+                        'Fact': float(y_test[i]),
                         'Model': 'LSTM Neural Network',
                         'Target_Var': target_var
                     })
 
-            # Метрики
-            clean_facts = np.array(all_facts)
-            clean_preds = np.array(all_preds)
-            r2 = r2_score(clean_facts, clean_preds) if clean_facts.size > 1 else np.nan
-            mae = mean_absolute_error(clean_facts, clean_preds) if clean_facts.size else np.nan
-            rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if clean_facts.size else np.nan
+            df_out = pd.DataFrame(all_res_rows, columns=FORECAST_COLUMNS)
+            metrics = calculate_forecast_metrics(paired_predictions(df_out), target_var)
 
             speed_samples_sec = total_samples / total_pred_time if total_pred_time > 0 else 0.0
             total_time = total_fit_time + total_pred_time
@@ -400,26 +392,27 @@ class LSTMFORECASTENGINE:
             print(f"    - Время прогноза (Predict Time):  {total_pred_time:.4f} сек")
             print(f"    - Суммарное время (Total Time):   {total_time:.4f} сек")
             print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_pred_time/12:.4f} сек/месяц)")
-            print(f"    - Метрики точности:               R² = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
+            print(format_forecast_metrics(metrics, padding='    '))
 
             # Сохранение CSV
-            df_out = pd.DataFrame(all_res_rows, columns=FORECAST_COLUMNS)
+            df_out = df_out.round({'Forecast': 4, 'Fact': 4})
             mark_prediction_source(df_out, dataset_name)
             df_out.to_csv(STD_CSV_DIR / fname, index=False)
 
-            self.summary_table.append({
-                'Блок': 'Стандартный прогноз',
+            model_info = {
+                'Блок': f'Стандартный прогноз ({target_year})',
                 'Датасет': dataset_name,
                 'Параметр': target_var,
                 'Модель': 'LSTM Neural Network',
+            }
+            self.summary_table.append({
+                **model_info,
                 'Fit Time (с)': round(total_fit_time, 4),
                 'Predict Time (с)': round(total_pred_time, 4),
                 'Total Time (с)': round(total_time, 4),
                 'Скорость (зап/с)': round(speed_samples_sec, 2),
-                'R²': round(r2, 4),
-                'MAE': round(mae, 4),
-                'RMSE': round(rmse, 4)
             })
+            self.accuracy_table.extend({**model_info, **row} for row in metrics)
 
     # ==========================================================================
     # 2. ДОЛГОСРОЧНАЯ ВАЛИДАЦИЯ
@@ -477,14 +470,10 @@ class LSTMFORECASTENGINE:
                 ))
 
             df_out = pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=FORECAST_COLUMNS)
-            paired = df_out.dropna(subset=['Fact'])
+            pairs = paired_predictions(df_out)
             if not df_out.empty:
-                print_monthly_errors(paired)
-            clean_facts = paired['Fact'].to_numpy()
-            clean_preds = paired['Forecast'].to_numpy()
-            r2 = r2_score(clean_facts, clean_preds) if clean_facts.size > 1 else np.nan
-            mae = mean_absolute_error(clean_facts, clean_preds) if clean_facts.size else np.nan
-            rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if clean_facts.size else np.nan
+                print_monthly_errors(pairs)
+            metrics = calculate_forecast_metrics(pairs, target_var)
 
             speed_samples_sec = len(df_out) / total_pred_time if total_pred_time > 0 else 0.0
             total_time = total_fit_time + total_pred_time
@@ -493,8 +482,8 @@ class LSTMFORECASTENGINE:
             print(f"    - Время прогноза (Predict Time):  {total_pred_time:.4f} сек")
             print(f"    - Суммарное время (Total Time):   {total_time:.4f} сек")
             print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_pred_time/len(test_years):.4f} сек/год)")
-            print(f"    - Метрики точности:               R² = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
-            print(f"    - Месячных прогнозов: {len(df_out)}, пар с фактом: {len(paired)}")
+            print(f"    - Месячных прогнозов: {len(df_out)}, пар с фактом: {len(pairs)}")
+            print(format_forecast_metrics(metrics, padding='    '))
 
             # Сохранение CSV
             df_out = df_out.reindex(columns=FORECAST_COLUMNS).round({'Forecast': 4, 'Fact': 4})
@@ -502,19 +491,20 @@ class LSTMFORECASTENGINE:
             mark_prediction_source(df_out, dataset_name)
             df_out.to_csv(VAL_CSV_DIR / fname, index=False)
 
-            self.summary_table.append({
-                'Блок': 'Долгосрочная валидация',
+            model_info = {
+                'Блок': f'Валидация ({split_year}-{final_year})',
                 'Датасет': dataset_name,
                 'Параметр': target_var,
                 'Модель': 'LSTM Neural Network',
+            }
+            self.summary_table.append({
+                **model_info,
                 'Fit Time (с)': round(total_fit_time, 4),
                 'Predict Time (с)': round(total_pred_time, 4),
                 'Total Time (с)': round(total_time, 4),
                 'Скорость (зап/с)': round(speed_samples_sec, 2),
-                'R²': round(r2, 4),
-                'MAE': round(mae, 4),
-                'RMSE': round(rmse, 4)
             })
+            self.accuracy_table.extend({**model_info, **row} for row in metrics)
 
     def print_final_summary(self):
         """Печать и сохранение сводной таблицы производительности и точности."""
@@ -522,7 +512,11 @@ class LSTMFORECASTENGINE:
         print("                           СВОДНАЯ ТАБЛИЦА РЕЗУЛЬТАТОВ ИСПЫТАНИЙ LSTM")
         print("="*115)
         df_summary = pd.DataFrame(self.summary_table)
-        print(df_summary.to_string(index=False))
+        if not df_summary.empty:
+            print("ПРОИЗВОДИТЕЛЬНОСТЬ")
+            print(df_summary.to_string(index=False))
+            print("\nТОЧНОСТЬ ПРОГНОЗОВ")
+            print(format_forecast_metrics(self.accuracy_table))
         print("="*115)
 
 

@@ -13,8 +13,47 @@ from kursach011_modules.annual_forecast import ANNUAL_FORECAST_MODE, prepare_ann
 from kursach011_modules.forecast_engine import (
     CRU_SOURCE_VERSION, LongTermValidator, StandardForecaster, read_prediction_csv, read_validation_csv,
 )
+from kursach011_modules.forecast_metrics import calculate_forecast_metrics, paired_predictions
 from kursach011_modules.monthly_features import create_forecast_features, prepare_forecast_period, select_model_rows
 from kursach011_modules.project_settings import forecast_filename, validation_filename
+
+
+class ForecastMetricsTest(unittest.TestCase):
+    def test_regional_metrics_use_paired_stations_and_distinct_calendar_months(self):
+        predictions = pd.DataFrame([
+            ('2024-01-01', 20.0, 30.0),
+            ('2024-01-01', 40.0, 30.0),
+            ('2024-01-01', 0.0, 0.0),
+            ('2024-01-01', np.nan, 300.0),
+            ('2024-01-01', 200.0, np.nan),
+            ('2024-02-01', 5.0, np.inf),
+            ('2025-01-01', 10.0, 14.0),
+        ], columns=['Date', 'Fact', 'Forecast'])
+
+        regional, station = calculate_forecast_metrics(paired_predictions(predictions), 'Precip')
+
+        self.assertEqual((regional['N'], station['N']), (2, 4))
+        self.assertAlmostEqual(regional['MAE'], 2.0)
+        self.assertAlmostEqual(station['MAE'], 6.0)
+        self.assertAlmostEqual(regional['RMSE'], np.sqrt(8))
+        self.assertAlmostEqual(station['RMSE'], np.sqrt(54))
+        self.assertEqual(regional['Ед. ошибки'], 'мм')
+
+    def test_empty_and_single_pair(self):
+        predictions = pd.DataFrame({
+            'Date': pd.to_datetime(['2024-01-01']),
+            'Fact': [0.0],
+            'Forecast': [2.0],
+        })
+
+        for metric in calculate_forecast_metrics(paired_predictions(predictions.iloc[:0]), 'DTR'):
+            self.assertEqual(metric['N'], 0)
+            self.assertTrue(all(np.isnan(metric[name]) for name in ['R2', 'MAE', 'RMSE']))
+        for metric in calculate_forecast_metrics(paired_predictions(predictions), 'DTR'):
+            self.assertEqual(metric['N'], 1)
+            self.assertEqual(metric['MAE'], 2.0)
+            self.assertTrue(np.isnan(metric['R2']))
+            self.assertEqual(metric['Ед. ошибки'], '°C')
 
 
 class ForecastHistoryTest(unittest.TestCase):
@@ -105,9 +144,9 @@ class ForecastHistoryTest(unittest.TestCase):
         )
         forecast.to_csv(forecaster.output_dir / filename, index=False)
 
-        self.assertFalse(forecaster._is_file_valid(filename, 'METEO_RU'))
+        self.assertIsNone(forecaster._load_cached_predictions(filename, 'METEO_RU'))
         forecaster._save_predictions([forecast], filename, 'METEO_RU')
-        self.assertTrue(forecaster._is_file_valid(filename, 'METEO_RU'))
+        self.assertIsNotNone(forecaster._load_cached_predictions(filename, 'METEO_RU'))
 
     def test_standard_forecast_replaces_legacy_cache_and_preserves_missing_facts(self):
         forecaster = StandardForecaster(self.output_dir, self.output_dir)
@@ -123,7 +162,8 @@ class ForecastHistoryTest(unittest.TestCase):
         self.assertEqual(output_text.count(
             'кандидатов: 47, допущено: 2, исключено: 45, прогнозов: 2, пар с фактом: 1'
         ), 2)
-        self.assertIn('R2=', output_text)
+        self.assertRegex(output_text, r'Региональные месячные средние\s+1\s+месяцы\s+—\s+0\.0000')
+        self.assertRegex(output_text, r'Станция — месяц\s+1\s+пары\s+—\s+0\.0000')
         results = pd.read_csv(output, parse_dates=['Date']).set_index('Date')
         january = results.loc['2024-01-01']
         self.assertEqual(january['WMO'], 'A')
@@ -131,7 +171,10 @@ class ForecastHistoryTest(unittest.TestCase):
         self.assertEqual(results.loc['2024-02-01', 'WMO'], 'A')
         self.assertTrue(pd.isna(results.loc['2024-02-01', 'Fact']))
         with patch.object(forecaster, 'load_data', side_effect=AssertionError('CSV cache was ignored')):
-            forecaster.run(2024, 'CRU_CEDA')
+            cached_output = self.run_with_cp1251_stdout(forecaster.run, 2024, 'CRU_CEDA')
+        self.assertEqual(cached_output.count('[SKIP]'), 2)
+        self.assertRegex(cached_output, r'Региональные месячные средние\s+1\s+месяцы')
+        self.assertRegex(cached_output, r'Станция — месяц\s+1\s+пары')
 
     def test_validation_forecasts_full_year_and_trains_only_on_completed_years(self):
         validator = LongTermValidator(self.output_dir, self.output_dir)
@@ -177,6 +220,8 @@ class ForecastHistoryTest(unittest.TestCase):
             output = self.run_with_cp1251_stdout(validator.run, 2024, 'CRU_CEDA', end_year=2025)
         self.assertEqual(fit_predict.call_count, 4)
         self.assertIn('Месячных прогнозов: 48, пар с фактом: 47', output)
+        self.assertRegex(output, r'Региональные месячные средние\s+24\s+месяцы')
+        self.assertRegex(output, r'Станция — месяц\s+47\s+пары')
         results = pd.read_csv(
             validator.output_dir / validation_filename('CRU_CEDA', 'Precip', 2024, 2025),
             parse_dates=['Date'],
@@ -186,10 +231,10 @@ class ForecastHistoryTest(unittest.TestCase):
         np.testing.assert_array_equal(results['Forecast'], results['Date'].dt.month)
         replaced = read_validation_csv(old_file, 'CRU_CEDA')
         self.assertEqual(len(replaced), 48)
-        self.assertTrue(validator._is_file_valid(old_file.name, 'CRU_CEDA'))
+        self.assertIsNotNone(validator._load_cached_predictions(old_file.name, 'CRU_CEDA'))
         mixed = pd.concat([replaced, legacy], ignore_index=True)
         mixed.to_csv(old_file, index=False)
-        self.assertFalse(validator._is_file_valid(old_file.name, 'CRU_CEDA'))
+        self.assertIsNone(validator._load_cached_predictions(old_file.name, 'CRU_CEDA'))
 
     def test_standard_forecast_handles_a_year_with_no_history(self):
         forecaster = StandardForecaster(self.output_dir, self.output_dir)
@@ -213,12 +258,12 @@ class ForecastHistoryTest(unittest.TestCase):
         mixed = pd.concat([forecast.assign(Source_Version=CRU_SOURCE_VERSION), old_version], ignore_index=True)
         for stale in (forecast, old_version, mixed):
             stale.to_csv(output, index=False)
-            self.assertFalse(validator._is_file_valid(filename, 'CRU_CEDA'))
+            self.assertIsNone(validator._load_cached_predictions(filename, 'CRU_CEDA'))
             with self.assertRaisesRegex(ValueError, 'требуется результат расчёта'):
                 read_prediction_csv(output, 'CRU_CEDA')
 
         validator._save_predictions([forecast], filename, 'CRU_CEDA')
-        self.assertTrue(validator._is_file_valid(filename, 'CRU_CEDA'))
+        self.assertIsNotNone(validator._load_cached_predictions(filename, 'CRU_CEDA'))
         result = read_prediction_csv(output, 'CRU_CEDA')
         self.assertEqual(result['Source_Version'].tolist(), [CRU_SOURCE_VERSION])
 

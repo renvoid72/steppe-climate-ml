@@ -53,6 +53,7 @@ def annual_prediction_rows(anchors, predictions, facts, model_name, target_var):
 
 def print_monthly_errors(paired):
     """Показывает MAE и покрытие по каждому горизонту годового прогноза."""
+    print('    MAE по горизонтам для пар «станция — месяц»')
     abs_errors = (paired['Forecast'] - paired['Fact']).abs()
     scores = abs_errors.groupby(paired['Date'].dt.month).agg(['mean', 'size'])
     scores = scores.reindex(FORECAST_MONTHS)

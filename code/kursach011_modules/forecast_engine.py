@@ -5,7 +5,6 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import r2_score, mean_absolute_error
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import warnings
@@ -13,6 +12,7 @@ import warnings
 from .annual_forecast import (
     ANNUAL_FORECAST_MODE, annual_prediction_rows, annual_splits, annual_targets, prepare_annual_features,
 )
+from .forecast_metrics import calculate_forecast_metrics, format_forecast_metrics, paired_predictions
 from .meteo_data import load_monthly_meteo
 from .project_settings import CRU_VERSION, cru_csv_path, forecast_filename, validation_filename
 from .monthly_features import (
@@ -103,25 +103,36 @@ class BaseForecaster:
         }
         print(f"[{self.__class__.__name__}] Инициализирован. Папка: {self.output_dir}")
 
-    def _is_file_valid(self, filename, dataset_name):
-        """Проверяет версию CRU и действующее правило отбора строк."""
+    def _load_cached_predictions(self, filename, dataset_name):
+        """Читает совместимый CSV и проверяет действующее правило отбора строк."""
         try:
-            # Проверяем версию во всех строках CRU, включая вручную объединённые CSV.
-            nrows = None if dataset_name == 'CRU_CEDA' else 1
             path = self.output_dir / filename
             if self.forecast_mode == ANNUAL_FORECAST_MODE:
                 df = read_validation_csv(path, dataset_name)
             else:
-                df = read_prediction_csv(path, dataset_name, nrows=nrows)
+                df = read_prediction_csv(path, dataset_name)
         except (OSError, ValueError):
-            return False
+            return None
 
-        return (
+        if (
             not df.empty
             and set(FORECAST_COLUMNS).issubset(df.columns)
             and 'History_Policy' in df.columns
             and df['History_Policy'].iat[0] == HISTORY_POLICIES[dataset_name]
-        )
+        ):
+            return df
+        return None
+
+    def _report_cached_metrics(self, filename, dataset_name, target_var):
+        cached = self._load_cached_predictions(filename, dataset_name)
+        if cached is None:
+            return False
+        print(f"  [SKIP] Файл {filename} уже существует и корректен.")
+        for model_name, rows in cached.groupby('Model', sort=False):
+            print(f"    {model_name}")
+            metrics = calculate_forecast_metrics(paired_predictions(rows), target_var)
+            print(format_forecast_metrics(metrics, padding='      '))
+        return True
 
     def _save_predictions(self, predictions, filename, dataset_name):
         df = pd.concat(predictions) if predictions else pd.DataFrame(columns=FORECAST_COLUMNS)
@@ -227,9 +238,7 @@ class StandardForecaster(BaseForecaster):
         for target_var in ['DTR', 'Precip']:
             fname = forecast_filename(dataset_name, target_var, target_year)
             
-            # ПРОВЕРКА ФАЙЛА
-            if self._is_file_valid(fname, dataset_name):
-                print(f"  [SKIP] Файл {fname} уже существует и корректен.")
+            if self._report_cached_metrics(fname, dataset_name, target_var):
                 continue
 
             if df_full is None:
@@ -269,28 +278,16 @@ class StandardForecaster(BaseForecaster):
                     res['Target_Var'] = target_var
                     model_results.append(res)
 
-                self._print_coverage(
-                    len(forecast_rows),
-                    len(eligible_forecasts),
-                    sum(len(result) for result in model_results),
-                    sum(result['Fact'].count() for result in model_results),
-                )
-
-                if not model_results:
+                results = pd.concat(model_results) if model_results else pd.DataFrame(columns=FORECAST_COLUMNS)
+                pairs = paired_predictions(results)
+                self._print_coverage(len(forecast_rows), len(eligible_forecasts), len(results), len(pairs))
+                if model_results:
+                    all_predictions.append(results)
+                else:
                     print("    Нет строк для прогноза.")
-                    continue
 
-                model_predictions = pd.concat(model_results)
-                all_predictions.append(model_predictions)
-                estimated = model_predictions.dropna(subset=['Fact'])
-                monthly = estimated.groupby('Date')[['Fact', 'Forecast']].mean()
-                if monthly.empty:
-                    print("    Нет фактов для оценки.")
-                    continue
-
-                r2 = r2_score(monthly['Fact'], monthly['Forecast']) if len(monthly) > 1 else np.nan
-                mae = mean_absolute_error(monthly['Fact'], monthly['Forecast'])
-                print(f"    R2={r2:.4f}, MAE={mae:.4f}")
+                metrics = calculate_forecast_metrics(pairs, target_var)
+                print(format_forecast_metrics(metrics, padding='    '))
             
             self._save_predictions(all_predictions, fname, dataset_name)
             print(f"  -> Сохранено: {fname}")
@@ -316,8 +313,7 @@ class LongTermValidator(BaseForecaster):
         features = None
         for target_var in ['DTR', 'Precip']:
             fname = validation_filename(dataset_name, target_var, split_year, final_year)
-            if self._is_file_valid(fname, dataset_name):
-                print(f"  [SKIP] Файл {fname} уже существует и корректен.")
+            if self._report_cached_metrics(fname, dataset_name, target_var):
                 continue
 
             if features is None:
@@ -346,18 +342,16 @@ class LongTermValidator(BaseForecaster):
                     )
                     model_results.append(annual_prediction_rows(df_test, predictions, facts, model_name, target_var))
 
-                if not model_results:
+                results = pd.concat(model_results) if model_results else pd.DataFrame(columns=FORECAST_COLUMNS)
+                if model_results:
+                    all_predictions.append(results)
+                else:
                     print("      Нет строк для прогноза.")
-                    continue
 
-                results = pd.concat(model_results)
-                all_predictions.append(results)
-                paired = results.dropna(subset=['Fact'])
-                print(f"      Месячных прогнозов: {len(results)}, пар с фактом: {len(paired)}")
-                if not paired.empty:
-                    r2 = r2_score(paired['Fact'], paired['Forecast']) if len(paired) > 1 else np.nan
-                    mae = mean_absolute_error(paired['Fact'], paired['Forecast'])
-                    print(f"      R2={r2:.4f}, MAE={mae:.4f}")
+                pairs = paired_predictions(results)
+                print(f"      Месячных прогнозов: {len(results)}, пар с фактом: {len(pairs)}")
+                metrics = calculate_forecast_metrics(pairs, target_var)
+                print(format_forecast_metrics(metrics, padding='      '))
 
             self._save_predictions(all_predictions, fname, dataset_name)
             print(f"  -> Результаты валидации сохранены в {fname}")

@@ -17,7 +17,6 @@ import pandas as pd
 import numpy as np
 import warnings
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from kursach011_modules.project_settings import ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, results_dir
 
 warnings.filterwarnings('ignore')
@@ -32,6 +31,7 @@ sys.path.append(str(PROJECT_DIR / "code"))
 
 from kursach011_modules.forecast_engine import BaseForecaster, BEST_PARAMS
 from kursach011_modules.annual_forecast import annual_prediction_rows, annual_targets, prepare_annual_features, print_monthly_errors
+from kursach011_modules.forecast_metrics import calculate_forecast_metrics, format_forecast_metrics, paired_predictions
 from kursach011_modules.monthly_features import prepare_forecast_period, model_feature_columns, select_model_rows
 
 
@@ -64,6 +64,7 @@ class ForecastReporter(BaseForecaster):
     def __init__(self, base_dir, root_output_dir):
         super().__init__(base_dir, root_output_dir, "temp_report")
         self.summary_table = []
+        self.accuracy_table = []
 
     def _timed_fit_predict(self, df_train, df_test, model_name, target_var, dataset_name, *, y_train=None):
         """
@@ -135,8 +136,7 @@ class ForecastReporter(BaseForecaster):
                 total_fit_time = 0.0
                 total_predict_time = 0.0
                 total_samples = 0
-                all_preds = []
-                all_facts = []
+                results = []
 
                 # Walk-Forward по 12 месяцам года
                 for forecast_date in forecast_dates:
@@ -158,17 +158,10 @@ class ForecastReporter(BaseForecaster):
                     facts_map = dict(zip(facts_slice['WMO'], facts_slice[target_var]))
                     facts = df_pred['WMO'].map(facts_map).values
 
-                    all_preds.extend(preds)
-                    all_facts.extend(facts)
+                    results.append(pd.DataFrame({'Date': forecast_date, 'Fact': facts, 'Forecast': preds}))
 
-                # Расчет итоговых метрик по модели
-                valid_mask = ~np.isnan(all_facts)
-                clean_facts = np.array(all_facts)[valid_mask]
-                clean_preds = np.array(all_preds)[valid_mask]
-
-                r2 = r2_score(clean_facts, clean_preds) if len(clean_facts) > 1 else np.nan
-                mae = mean_absolute_error(clean_facts, clean_preds) if len(clean_facts) else np.nan
-                rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if len(clean_facts) else np.nan
+                predictions = pd.concat(results) if results else pd.DataFrame(columns=['Date', 'Fact', 'Forecast'])
+                metrics = calculate_forecast_metrics(paired_predictions(predictions), target_var)
                 
                 speed_samples_sec = total_samples / total_predict_time if total_predict_time > 0 else 0.0
                 total_time = total_fit_time + total_predict_time
@@ -177,21 +170,22 @@ class ForecastReporter(BaseForecaster):
                 print(f"    - Время прогноза (Predict Time):  {total_predict_time:.4f} сек")
                 print(f"    - Суммарное время (Total Time):   {total_time:.4f} сек")
                 print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_predict_time/12:.4f} сек/месяц)")
-                print(f"    - Метрики точности:               R2 = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
+                print(format_forecast_metrics(metrics, padding='    '))
 
-                self.summary_table.append({
-                    'Блок': 'Стандартный прогноз',
+                model_info = {
+                    'Блок': f'Стандартный прогноз ({target_year})',
                     'Датасет': dataset_name,
                     'Параметр': target_var,
                     'Модель': model_name,
+                }
+                self.summary_table.append({
+                    **model_info,
                     'Fit Time (с)': round(total_fit_time, 4),
                     'Predict Time (с)': round(total_predict_time, 4),
                     'Total Time (с)': round(total_time, 4),
                     'Скорость (зап/с)': round(speed_samples_sec, 2),
-                    'R2': round(r2, 4),
-                    'MAE': round(mae, 4),
-                    'RMSE': round(rmse, 4)
                 })
+                self.accuracy_table.extend({**model_info, **row} for row in metrics)
 
     def run_validation_report(self, split_year, dataset_name, end_year=VALIDATION_END_YEAR):
         """Прогон и измерение метрик для долгосрочной валидации."""
@@ -241,16 +235,11 @@ class ForecastReporter(BaseForecaster):
 
                     results.append(annual_prediction_rows(df_test, preds, facts, model_name, target_var))
 
+                predictions = pd.concat(results) if results else pd.DataFrame(columns=['Date', 'Fact', 'Forecast'])
+                pairs = paired_predictions(predictions)
                 if results:
-                    paired = pd.concat(results).dropna(subset=['Fact'])
-                    clean_facts, clean_preds = paired['Fact'], paired['Forecast']
-                    print_monthly_errors(paired)
-                else:
-                    clean_facts, clean_preds = [], []
-
-                r2 = r2_score(clean_facts, clean_preds) if len(clean_facts) > 1 else np.nan
-                mae = mean_absolute_error(clean_facts, clean_preds) if len(clean_facts) else np.nan
-                rmse = np.sqrt(mean_squared_error(clean_facts, clean_preds)) if len(clean_facts) else np.nan
+                    print_monthly_errors(pairs)
+                metrics = calculate_forecast_metrics(pairs, target_var)
 
                 speed_samples_sec = total_samples / total_predict_time if total_predict_time > 0 else 0.0
                 total_time = total_fit_time + total_predict_time
@@ -259,22 +248,23 @@ class ForecastReporter(BaseForecaster):
                 print(f"    - Время прогноза (Predict Time):  {total_predict_time:.4f} сек")
                 print(f"    - Суммарное время (Total Time):   {total_time:.4f} сек")
                 print(f"    - Скорость вычислений:            {speed_samples_sec:.2f} записей/сек ({total_predict_time/len(test_years):.4f} сек/год)")
-                print(f"    - Метрики точности ({split_year}-{final_year}):   R2 = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}")
-                print(f"    - Месячных прогнозов: {total_samples}, пар с фактом: {len(clean_facts)}")
+                print(f"    - Месячных прогнозов: {total_samples}, пар с фактом: {len(pairs)}")
+                print(format_forecast_metrics(metrics, padding='    '))
 
-                self.summary_table.append({
+                model_info = {
                     'Блок': f'Валидация ({split_year}-{final_year})',
                     'Датасет': dataset_name,
                     'Параметр': target_var,
                     'Модель': model_name,
+                }
+                self.summary_table.append({
+                    **model_info,
                     'Fit Time (с)': round(total_fit_time, 4),
                     'Predict Time (с)': round(total_predict_time, 4),
                     'Total Time (с)': round(total_time, 4),
                     'Скорость (зап/с)': round(speed_samples_sec, 2),
-                    'R2': round(r2, 4),
-                    'MAE': round(mae, 4),
-                    'RMSE': round(rmse, 4)
                 })
+                self.accuracy_table.extend({**model_info, **row} for row in metrics)
 
     def print_summary_table(self):
         """Отрисовывает финальную сводную таблицу результатов."""
@@ -283,9 +273,10 @@ class ForecastReporter(BaseForecaster):
         print("="*110)
         df_sum = pd.DataFrame(self.summary_table)
         if not df_sum.empty:
-            pd.set_option('display.max_columns', 15)
-            pd.set_option('display.width', 1000)
+            print("ПРОИЗВОДИТЕЛЬНОСТЬ")
             print(df_sum.to_string(index=False))
+            print("\nТОЧНОСТЬ ПРОГНОЗОВ")
+            print(format_forecast_metrics(self.accuracy_table))
         print("="*110 + "\n")
 
 
