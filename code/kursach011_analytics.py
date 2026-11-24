@@ -21,9 +21,9 @@ from shapely.geometry import mapping
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 from kursach011_modules.forecast_engine import read_validation_csv
+from kursach011_modules.forecast_metrics import calculate_forecast_metrics, format_forecast_metrics, paired_predictions
 from kursach011_modules.annual_forecast import FORECAST_MONTHS
 from kursach011_modules.meteo_data import load_monthly_meteo
 from kursach011_modules.project_settings import (
@@ -301,7 +301,7 @@ def calculate_and_save_metrics(raw_datasets):
         f.write(f"МЕТРИКИ ПРЯМОГО ПРОГНОЗА НА 12 МЕСЯЦЕВ ({VALIDATION_PERIOD} гг., ежегодное переобучение)\n")
         f.write("========================================================================\n\n")
 
-        for key, info in raw_datasets.items():
+        for info in raw_datasets.values():
             df_raw = info['raw']
             var = info['var']
             dataset = info['dataset']
@@ -310,22 +310,12 @@ def calculate_and_save_metrics(raw_datasets):
             f.write("-" * 60 + "\n")
             
             models = ['Random Forest', 'K-Neighbors', 'MLP Neural Network']
+            rows = []
             for model in models:
-                model_data = df_raw[df_raw['Model'] == model].dropna(subset=['Forecast', 'Fact'])
-                if not model_data.empty:
-                    y_true = model_data['Fact'].values
-                    y_pred = model_data['Forecast'].values
-                    
-                    r2 = r2_score(y_true, y_pred)
-                    mae = mean_absolute_error(y_true, y_pred)
-                    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-                    
-                    f.write(f"Модель: {model}\n")
-                    f.write(f"  R²:   {r2:8.4f}\n")
-                    f.write(f"  MAE:  {mae:8.4f}\n")
-                    f.write(f"  RMSE: {rmse:8.4f}\n\n")
-                else:
-                    f.write(f"Модель: {model} — Данные отсутствуют.\n\n")
+                pairs = paired_predictions(df_raw[df_raw['Model'] == model])
+                metrics = calculate_forecast_metrics(pairs, var)
+                rows.extend({'Модель': model, **row} for row in metrics)
+            f.write(format_forecast_metrics(rows) + "\n\n")
             f.write("=" * 70 + "\n\n")
 
     print(f"   -> Метрики точности сохранены в: {output_path.name}")
