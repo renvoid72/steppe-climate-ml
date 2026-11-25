@@ -22,14 +22,15 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from kursach011_modules.forecast_engine import read_validation_csv
+from kursach011_modules.forecast_engine import prepare_monthly_forecast_data, read_validation_csv
 from kursach011_modules.forecast_metrics import (
-    calculate_forecast_metrics, format_forecast_metrics, paired_predictions, regional_forecast_summary,
+    calculate_climatology_comparison, format_forecast_metrics, regional_forecast_summary, station_month_climatology,
 )
 from kursach011_modules.annual_forecast import FORECAST_MONTHS
 from kursach011_modules.meteo_data import load_monthly_meteo
 from kursach011_modules.project_settings import (
-    ANALYSIS_YEAR, CRU_VERSION, VALIDATION_END_YEAR, VALIDATION_PERIOD, cru_csv_path, results_dir, validation_filename,
+    ANALYSIS_YEAR, CRU_VERSION, VALIDATION_START_YEAR, VALIDATION_END_YEAR, VALIDATION_PERIOD,
+    cru_csv_path, results_dir, validation_filename,
 )
 
 warnings.filterwarnings('ignore')
@@ -279,10 +280,16 @@ def generate_fact_only_excel_reports(fact_datasets):
 
 
 
-def calculate_and_save_metrics(raw_datasets):
+def calculate_and_save_metrics(raw_datasets, fact_datasets):
     """Рассчитывает метрики за общий период валидации и сохраняет их в metrics_summary.txt."""
     print(f"4. Расчет общих метрик точности моделей ({VALIDATION_PERIOD} гг.)...")
     output_path = ANALYTICS_DIR / "metrics_summary.txt"
+    years = range(VALIDATION_START_YEAR, VALIDATION_END_YEAR + 1)
+    climatologies = {
+        dataset: station_month_climatology(prepare_monthly_forecast_data(monthly, dataset), years)
+        for dataset, monthly in fact_datasets.items()
+        if not monthly.empty
+    }
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("========================================================================\n")
@@ -293,15 +300,17 @@ def calculate_and_save_metrics(raw_datasets):
             df_raw = info['raw']
             var = info['var']
             dataset = info['dataset']
+            climatology = climatologies.get(dataset)
             
             f.write(f"ДАТАСЕТ: {dataset} | ПОКАЗАТЕЛЬ: {var}\n")
             f.write("-" * 60 + "\n")
+            if climatology is None:
+                f.write("Для сравнения с климатологией нужны исходные месячные ряды.\n")
             
-            models = ['Random Forest', 'K-Neighbors', 'MLP Neural Network']
             rows = []
-            for model in models:
-                pairs = paired_predictions(df_raw[df_raw['Model'] == model])
-                metrics = calculate_forecast_metrics(pairs, var)
+            for model in FORECAST_MODELS:
+                predictions = df_raw.loc[df_raw['Model'] == model]
+                metrics = calculate_climatology_comparison(predictions, climatology, var)
                 rows.extend({'Модель': model, **row} for row in metrics)
             f.write(format_forecast_metrics(rows) + "\n\n")
             f.write("=" * 70 + "\n\n")
@@ -544,7 +553,7 @@ def main():
     
     # Шаг 4. Метрики в txt
     print()
-    calculate_and_save_metrics(dataset_info)
+    calculate_and_save_metrics(dataset_info, fact_datasets)
     
     # Шаг 5. Атлас карт
     print()

@@ -13,7 +13,9 @@ from kursach011_modules.annual_forecast import ANNUAL_FORECAST_MODE, prepare_ann
 from kursach011_modules.forecast_engine import (
     CRU_SOURCE_VERSION, LongTermValidator, StandardForecaster, read_prediction_csv, read_validation_csv,
 )
-from kursach011_modules.forecast_metrics import calculate_forecast_metrics, paired_predictions
+from kursach011_modules.forecast_metrics import (
+    calculate_climatology_comparison, calculate_forecast_metrics, paired_predictions, station_month_climatology,
+)
 from kursach011_modules.monthly_features import create_forecast_features, prepare_forecast_period, select_model_rows
 from kursach011_modules.project_settings import forecast_filename, validation_filename
 
@@ -54,6 +56,56 @@ class ForecastMetricsTest(unittest.TestCase):
             self.assertEqual(metric['MAE'], 2.0)
             self.assertTrue(np.isnan(metric['R2']))
             self.assertEqual(metric['Ед. ошибки'], '°C')
+
+    def test_climatology_uses_only_prior_years_for_each_station_month_and_target(self):
+        history = pd.DataFrame([
+            ('A', '2018-01-01', 4., 0.),
+            ('A', '2019-01-01', 6., 20.),
+            ('A', '2019-06-01', 8., 9.),
+            ('A', '2020-01-01', 12., 40.),
+            ('A', '2020-06-01', 90., 900.),
+            ('A', '2021-01-01', 99., 999.),
+            ('B', '2019-01-01', np.nan, 60.),
+            ('B', '2018-01-01', np.inf, np.nan),
+            ('C', '2020-01-01', 1., 1.),
+        ], columns=['WMO', 'Date', 'DTR', 'Precip'])
+        history['Date'] = pd.to_datetime(history['Date'])
+        climate = station_month_climatology(history, [2020, 2021])
+
+        self.assertEqual(climate.loc[('A', pd.Timestamp('2020-01-01'))].tolist(), [5., 10.])
+        self.assertEqual(climate.loc[('A', pd.Timestamp('2020-06-01'))].tolist(), [8., 9.])
+        self.assertEqual(climate.loc[('A', pd.Timestamp('2021-01-01')), 'Precip'], 20.)
+        self.assertTrue(np.isnan(climate.loc[('B', pd.Timestamp('2020-01-01')), 'DTR']))
+        self.assertEqual(climate.loc[('B', pd.Timestamp('2020-01-01')), 'Precip'], 60.)
+        self.assertNotIn(('C', pd.Timestamp('2020-01-01')), climate.index)
+
+    def test_climatology_comparison_scores_the_same_finite_pairs_at_both_levels(self):
+        history = pd.DataFrame([
+            ('A', '2019-01-01', 0.), ('B', '2019-01-01', 14.), ('A', '2019-02-01', 10.),
+            ('D', '2019-01-01', 50.), ('E', '2019-01-01', 55.), ('F', '2019-01-01', 8.),
+        ], columns=['WMO', 'Date', 'Precip']).assign(DTR=np.nan)
+        history['Date'] = pd.to_datetime(history['Date'])
+        climate = station_month_climatology(history, [2020])
+        predictions = pd.DataFrame([
+            ('A', '2020-01-01', 10., 4.), ('B', '2020-01-01', 20., 24.),
+            ('C', '2020-01-01', 999., 0.), ('D', '2020-01-01', np.nan, 0.),
+            ('E', '2020-01-01', 90., np.nan), ('F', '2020-01-01', 90., np.inf),
+            ('A', '2020-02-01', 14., 12.),
+        ], columns=['WMO', 'Date', 'Fact', 'Forecast'])
+        regional, station = calculate_climatology_comparison(predictions, climate, 'Precip')
+
+        self.assertEqual((regional['N'], station['N']), (2, 3))
+        self.assertEqual((regional['MAE'], regional['MAE климатологии']), (1.5, 6.))
+        self.assertEqual((station['MAE'], station['MAE климатологии']), (4., 20. / 3))
+        self.assertAlmostEqual(station['RMSE климатологии'], np.sqrt(152 / 3))
+        self.assertAlmostEqual(regional['R2 климатологии'], -159.)
+        self.assertAlmostEqual(regional['Снижение MAE, %'], 75.)
+        self.assertAlmostEqual(station['Снижение MAE, %'], 40.)
+
+        exact_climate = predictions.iloc[:1].assign(Fact=0.)
+        for row in calculate_climatology_comparison(exact_climate, climate, 'Precip'):
+            self.assertEqual(row['MAE климатологии'], 0.)
+            self.assertTrue(np.isnan(row['Снижение MAE, %']))
 
 
 class ForecastHistoryTest(unittest.TestCase):
@@ -164,17 +216,26 @@ class ForecastHistoryTest(unittest.TestCase):
         ), 2)
         self.assertRegex(output_text, r'Региональные месячные средние\s+1\s+месяцы\s+—\s+0\.0000')
         self.assertRegex(output_text, r'Станция — месяц\s+1\s+пары\s+—\s+0\.0000')
+        self.assertEqual(output_text.count('MAE климатологии'), 2)
         results = pd.read_csv(output, parse_dates=['Date']).set_index('Date')
         january = results.loc['2024-01-01']
         self.assertEqual(january['WMO'], 'A')
         self.assertEqual(january['Fact'], 0.0)
         self.assertEqual(results.loc['2024-02-01', 'WMO'], 'A')
         self.assertTrue(pd.isna(results.loc['2024-02-01', 'Fact']))
-        with patch.object(forecaster, 'load_data', side_effect=AssertionError('CSV cache was ignored')):
+        saved = output.read_bytes()
+        with patch.object(forecaster, '_fit_predict_model', side_effect=AssertionError('CSV cache was ignored')):
             cached_output = self.run_with_cp1251_stdout(forecaster.run, 2024, 'CRU_CEDA')
         self.assertEqual(cached_output.count('[SKIP]'), 2)
+        self.assertEqual(cached_output.count('MAE климатологии'), 2)
         self.assertRegex(cached_output, r'Региональные месячные средние\s+1\s+месяцы')
         self.assertRegex(cached_output, r'Станция — месяц\s+1\s+пары')
+        self.assertEqual(output.read_bytes(), saved)
+
+        with patch.object(forecaster, 'load_data', return_value=pd.DataFrame()):
+            cached_only = self.run_with_cp1251_stdout(forecaster.run, 2024, 'CRU_CEDA')
+        self.assertEqual(cached_only.count('[SKIP]'), 2)
+        self.assertEqual(cached_only.count('Для сравнения с климатологией нужны исходные месячные ряды.'), 2)
 
     def test_validation_forecasts_full_year_and_trains_only_on_completed_years(self):
         validator = LongTermValidator(self.output_dir, self.output_dir)
@@ -222,6 +283,7 @@ class ForecastHistoryTest(unittest.TestCase):
         self.assertIn('Месячных прогнозов: 48, пар с фактом: 47', output)
         self.assertRegex(output, r'Региональные месячные средние\s+24\s+месяцы')
         self.assertRegex(output, r'Станция — месяц\s+47\s+пары')
+        self.assertEqual(output.count('MAE климатологии'), 2)
         results = pd.read_csv(
             validator.output_dir / validation_filename('CRU_CEDA', 'Precip', 2024, 2025),
             parse_dates=['Date'],

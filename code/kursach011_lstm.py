@@ -24,8 +24,10 @@ from torch.utils.data import TensorDataset, DataLoader
 from kursach011_modules.annual_forecast import (
     ANNUAL_FORECAST_MODE, annual_prediction_rows, annual_splits, annual_targets, print_monthly_errors,
 )
-from kursach011_modules.forecast_engine import mark_prediction_source
-from kursach011_modules.forecast_metrics import calculate_forecast_metrics, format_forecast_metrics, paired_predictions
+from kursach011_modules.forecast_engine import mark_prediction_source, prepare_monthly_forecast_data
+from kursach011_modules.forecast_metrics import (
+    calculate_climatology_comparison, format_forecast_metrics, paired_predictions, station_month_climatology,
+)
 from kursach011_modules.project_settings import (
     ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR,
     cru_csv_path, forecast_filename, results_dir, validation_filename,
@@ -144,12 +146,7 @@ class LSTMFORECASTENGINE:
         else:
             raise ValueError(f"Неизвестный dataset_name: {dataset_name}")
 
-        df_monthly['Date'] = pd.to_datetime(df_monthly[['Year', 'Month']].assign(day=1))
-        df_monthly = df_monthly[df_monthly['Year'] >= 1960]
-        required_columns = ['Latitude', 'Longitude']
-        if dataset_name == 'CRU_CEDA':
-            required_columns.extend(['DTR', 'Precip'])
-        df_monthly = df_monthly.dropna(subset=required_columns)
+        df_monthly = prepare_monthly_forecast_data(df_monthly, dataset_name)
         df_monthly = df_monthly.sort_values(by=['WMO', 'Date']).reset_index(drop=True)
         return df_monthly
 
@@ -322,6 +319,7 @@ class LSTMFORECASTENGINE:
         if df_full.empty:
             return
 
+        climatology = station_month_climatology(df_full, [target_year])
         STD_CSV_DIR.mkdir(parents=True, exist_ok=True)
         for target_var in ['DTR', 'Precip']:
             fname = forecast_filename(dataset_name, target_var, target_year)
@@ -391,7 +389,7 @@ class LSTMFORECASTENGINE:
 
             df_out = pd.DataFrame(all_res_rows, columns=FORECAST_COLUMNS)
             pairs = paired_predictions(df_out)
-            metrics = calculate_forecast_metrics(pairs, target_var)
+            metrics = calculate_climatology_comparison(df_out, climatology, target_var)
 
             speed_samples_sec = total_samples / total_pred_time if total_pred_time > 0 else 0.0
             total_time = total_fit_time + total_pred_time
@@ -446,6 +444,7 @@ class LSTMFORECASTENGINE:
         if not test_years:
             return
 
+        climatology = station_month_climatology(df_full, test_years)
         history = df_full.loc[df_full['Year'] < final_year]
         VAL_CSV_DIR.mkdir(parents=True, exist_ok=True)
         for target_var in ['DTR', 'Precip']:
@@ -482,7 +481,7 @@ class LSTMFORECASTENGINE:
             pairs = paired_predictions(df_out)
             if not df_out.empty:
                 print_monthly_errors(pairs)
-            metrics = calculate_forecast_metrics(pairs, target_var)
+            metrics = calculate_climatology_comparison(df_out, climatology, target_var)
 
             speed_samples_sec = len(df_out) / total_pred_time if total_pred_time > 0 else 0.0
             total_time = total_fit_time + total_pred_time

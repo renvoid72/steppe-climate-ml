@@ -205,6 +205,7 @@ class LSTMCalendarWindowsTest(unittest.TestCase):
         self.assertIn('Месячных прогнозов: 3, пар с фактом: 1', console.getvalue())
         metrics = [row for row in engine.accuracy_table if row['Параметр'] == 'Precip']
         self.assertEqual([(row['N'], row['MAE']) for row in metrics], [(1, 43.0), (1, 43.0)])
+        self.assertEqual([row['MAE климатологии'] for row in metrics], [24.0, 24.0])
 
     def test_lstm_keeps_tensor_and_date_types_when_all_windows_cross_a_gap(self):
         sparse = self.source.loc[
