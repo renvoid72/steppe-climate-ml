@@ -6,6 +6,9 @@
 # Результаты расчётов
 /output*/
 
+# Диагностика обучения MLP
+/diagnostics/mlp/
+
 # Окружение и кэш Python
 .venv/
 venv/

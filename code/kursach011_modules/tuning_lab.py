@@ -25,7 +25,7 @@ from .model_parameters import (
     read_model_parameters, save_model_parameters,
 )
 from .monthly_features import monthly_splits, prepare_forecast_period, select_model_rows
-from .project_settings import results_dir
+from .project_settings import mlp_diagnostics_dir, results_dir
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 TUNING_YEARS = {
@@ -172,7 +172,7 @@ def main():
     args = parser.parse_args()
     modes = FORECAST_MODES if args.mode == 'both' else (args.mode,)
     path = results_dir(BASE_DIR) / MODEL_PARAMS_FILENAME
-    diagnostics_dir = path.parent / 'mlp_diagnostics' / 'tuning'
+    diagnostics_dir = mlp_diagnostics_dir(BASE_DIR) / 'tuning'
     active_records = read_model_parameters(path)
     updates = {}
     for dataset_name in BEST_PARAMS:

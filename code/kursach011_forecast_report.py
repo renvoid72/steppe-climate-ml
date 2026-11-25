@@ -15,7 +15,8 @@ from pathlib import Path
 import pandas as pd
 import warnings
 from kursach011_modules.project_settings import (
-    ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, forecast_filename, results_dir, validation_filename,
+    ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR,
+    forecast_filename, mlp_diagnostics_dir, results_dir, validation_filename,
 )
 
 warnings.filterwarnings('ignore')
@@ -69,7 +70,7 @@ class ForecastReporter(BaseForecaster):
     """
     def __init__(self, base_dir, root_output_dir):
         super().__init__(base_dir, root_output_dir, "temp_report")
-        self.diagnostics_dir = Path(root_output_dir) / 'mlp_diagnostics' / 'forecast_report'
+        self.diagnostics_dir = mlp_diagnostics_dir(self.base_dir) / 'forecast_report'
         self.summary_table = []
         self.accuracy_table = []
 

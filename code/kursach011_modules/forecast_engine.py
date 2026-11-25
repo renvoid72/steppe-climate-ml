@@ -21,7 +21,7 @@ from .forecast_metrics import (
 from .meteo_data import load_monthly_meteo
 from .mlp_diagnostics import MlpDiagnostics
 from .model_parameters import BEST_PARAMS, MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE, read_model_parameters
-from .project_settings import CRU_VERSION, cru_csv_path, forecast_filename, validation_filename
+from .project_settings import CRU_VERSION, cru_csv_path, forecast_filename, mlp_diagnostics_dir, validation_filename
 from .monthly_features import (
     prepare_forecast_period,
     create_time_features,
@@ -139,7 +139,7 @@ class BaseForecaster:
         self.parameter_records = read_model_parameters(params_path)
         self.output_dir = Path(root_output_dir) / subfolder_name / 'csv_data'
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.diagnostics_dir = Path(root_output_dir) / 'mlp_diagnostics' / subfolder_name
+        self.diagnostics_dir = mlp_diagnostics_dir(self.base_dir) / subfolder_name
         self.mlp_diagnostics = MlpDiagnostics()
         self.model_classes = REGRESSORS.copy()
         print(f"[{self.__class__.__name__}] Инициализирован. Папка: {self.output_dir}")
