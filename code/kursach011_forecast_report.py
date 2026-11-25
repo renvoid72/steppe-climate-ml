@@ -14,9 +14,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
-import numpy as np
 import warnings
-from sklearn.preprocessing import StandardScaler
 from kursach011_modules.project_settings import ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, results_dir
 
 warnings.filterwarnings('ignore')
@@ -29,12 +27,17 @@ REPORT_FILE = RESULTS_DIR / "forecast_report.txt"
 # Добавляем путь к модулям проекта
 sys.path.append(str(PROJECT_DIR / "code"))
 
-from kursach011_modules.forecast_engine import BaseForecaster, BEST_PARAMS, FORECAST_COLUMNS
-from kursach011_modules.annual_forecast import annual_prediction_rows, annual_targets, prepare_annual_features, print_monthly_errors
+from kursach011_modules.forecast_engine import (
+    BaseForecaster, FORECAST_COLUMNS, build_regressor, prepare_regression_inputs, restore_regression_predictions,
+)
+from kursach011_modules.model_parameters import MONTHLY_FORECAST_MODE
+from kursach011_modules.annual_forecast import (
+    ANNUAL_FORECAST_MODE, annual_prediction_rows, annual_targets, prepare_annual_features, print_monthly_errors,
+)
 from kursach011_modules.forecast_metrics import (
     calculate_climatology_comparison, format_forecast_metrics, paired_predictions, station_month_climatology,
 )
-from kursach011_modules.monthly_features import prepare_forecast_period, model_feature_columns, select_model_rows
+from kursach011_modules.monthly_features import monthly_splits, prepare_forecast_period, select_model_rows
 
 
 class DualLogger:
@@ -68,30 +71,13 @@ class ForecastReporter(BaseForecaster):
         self.summary_table = []
         self.accuracy_table = []
 
-    def _timed_fit_predict(self, df_train, df_test, model_name, target_var, dataset_name, *, y_train=None):
-        """
-        Идентичная обучающая логика _fit_predict_model из forecast_engine.py,
-        но с раздельным хронометрированием этапов fit() и predict().
-        """
-        params = BEST_PARAMS[dataset_name][target_var][model_name]
-        
-        feature_cols = model_feature_columns(df_train)
-        
-        scaler = StandardScaler().fit(df_train[feature_cols])
-        
-        model_args = {'random_state': 42} if 'Random' in model_name or 'MLP' in model_name else {}
-        if 'Random' in model_name or 'Neighbors' in model_name:
-            model_args['n_jobs'] = -1
-            
-        model = self.model_classes[model_name](**params, **model_args)
-        
-        if y_train is None:
-            y_train = df_train[target_var]
-        if target_var == 'Precip':
-            y_train = np.log1p(y_train)
-        
-        X_train_scaled = scaler.transform(df_train[feature_cols])
-        X_test_scaled = scaler.transform(df_test[feature_cols])
+    def _timed_fit_predict(
+        self, df_train, df_test, model_name, target_var, dataset_name, *, y_train=None, mode=MONTHLY_FORECAST_MODE,
+    ):
+        """Использует рабочую конфигурацию и раздельно измеряет fit() и predict()."""
+        params = self.model_parameters(model_name, target_var, dataset_name, mode=mode)
+        model = build_regressor(self.model_classes[model_name], model_name, params)
+        X_train_scaled, X_test_scaled, y_train = prepare_regression_inputs(df_train, df_test, target_var, y_train)
 
         # 1. Замер времени обучения (Fit Time)
         t_fit_start = time.perf_counter()
@@ -105,8 +91,7 @@ class ForecastReporter(BaseForecaster):
         t_pred_end = time.perf_counter()
         predict_time = t_pred_end - t_pred_start
 
-        final_preds = np.expm1(raw_preds) if target_var == 'Precip' else raw_preds
-        final_preds = np.maximum(0, final_preds)
+        final_preds = restore_regression_predictions(raw_preds, target_var)
 
         return final_preds, fit_time, predict_time, final_preds.size
 
@@ -142,10 +127,7 @@ class ForecastReporter(BaseForecaster):
                 results = []
 
                 # Walk-Forward по 12 месяцам года
-                for forecast_date in forecast_dates:
-                    df_train = train_rows.loc[train_rows['Date'] < forecast_date]
-                    df_pred = eligible_forecasts.loc[eligible_forecasts['Date'] == forecast_date]
-                    
+                for forecast_date, df_train, df_pred in monthly_splits(train_rows, eligible_forecasts, forecast_dates):
                     if not self._can_predict(df_train, df_pred, model_name, target_var, dataset_name):
                         continue
 
@@ -232,7 +214,7 @@ class ForecastReporter(BaseForecaster):
                 splits = self.annual_model_splits(features, targets, test_years, model_name, target_var, dataset_name)
                 for df_train, df_test, y_train, facts in splits:
                     preds, fit_t, pred_t, n_samp = self._timed_fit_predict(
-                        df_train, df_test, model_name, target_var, dataset_name, y_train=y_train,
+                        df_train, df_test, model_name, target_var, dataset_name, y_train=y_train, mode=ANNUAL_FORECAST_MODE,
                     )
 
                     total_fit_time += fit_t

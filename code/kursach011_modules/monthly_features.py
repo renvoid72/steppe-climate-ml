@@ -28,6 +28,12 @@ def select_model_rows(df, target_var=None):
     return df.dropna(subset=required)
 
 
+def monthly_splits(train_rows, forecast_rows, forecast_dates):
+    """Для каждой даты выпуска отдаёт историю и строки ровно на один месяц."""
+    for date in forecast_dates:
+        yield date, train_rows.loc[train_rows['Date'] < date], forecast_rows.loc[forecast_rows['Date'] == date]
+
+
 def create_forecast_features(df, forecast_date):
     """Рассчитывает признаки для истории и целевого месяца без его наблюдений."""
     history = df.loc[df['Date'] < forecast_date]
