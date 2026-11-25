@@ -4,8 +4,7 @@
 Выполняет обучение и прогнозирование с помощью моделей Random Forest, K-Neighbors и MLP,
 замеряет точное время обучения, прогноза, скорость обработки данных и точность (R2, MAE, RMSE).
 
-Результаты НЕ сохраняются в CSV, а выгружаются в ЕДИНСТВЕННЫЙ итоговый файл:
-forecast_report.txt в каталоге результатов рабочей версии CRU.
+Метрики сохраняются в forecast_report.txt, диагностика MLP — в отдельных JSON.
 """
 
 import sys
@@ -15,7 +14,9 @@ from datetime import datetime
 from pathlib import Path
 import pandas as pd
 import warnings
-from kursach011_modules.project_settings import ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, results_dir
+from kursach011_modules.project_settings import (
+    ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, forecast_filename, results_dir, validation_filename,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -68,6 +69,7 @@ class ForecastReporter(BaseForecaster):
     """
     def __init__(self, base_dir, root_output_dir):
         super().__init__(base_dir, root_output_dir, "temp_report")
+        self.diagnostics_dir = Path(root_output_dir) / 'mlp_diagnostics' / 'forecast_report'
         self.summary_table = []
         self.accuracy_table = []
 
@@ -81,7 +83,7 @@ class ForecastReporter(BaseForecaster):
 
         # 1. Замер времени обучения (Fit Time)
         t_fit_start = time.perf_counter()
-        model.fit(X_train_scaled, y_train)
+        self._fit_regressor(model, X_train_scaled, y_train, df_test, target_var, dataset_name, mode=mode)
         t_fit_end = time.perf_counter()
         fit_time = t_fit_end - t_fit_start
 
@@ -97,6 +99,7 @@ class ForecastReporter(BaseForecaster):
 
     def run_standard_forecast_report(self, target_year, dataset_name):
         """Помесячная оценка с горизонтом один месяц и ежемесячным обучением."""
+        self.mlp_diagnostics.fits.clear()
         print("\n" + "="*80)
         print(f" БЛОК 1: ПРОГНОЗ НА МЕСЯЦ ({dataset_name} | Период оценки: {target_year})")
         print(" Переобучение ежемесячно")
@@ -173,9 +176,11 @@ class ForecastReporter(BaseForecaster):
                     'Скорость (зап/с)': round(speed_samples_sec, 2),
                 })
                 self.accuracy_table.extend({**model_info, **row} for row in metrics)
+            self._save_mlp_diagnostics(forecast_filename(dataset_name, target_var, target_year))
 
     def run_validation_report(self, split_year, dataset_name, end_year=VALIDATION_END_YEAR):
         """Прогон и измерение метрик для долгосрочной валидации."""
+        self.mlp_diagnostics.fits.clear()
         print("\n" + "="*80)
         print(f" БЛОК 2: ПРЯМОЙ ПРОГНОЗ НА 12 МЕСЯЦЕВ ({dataset_name} | Период оценки: {split_year}-{end_year})")
         print(" Переобучение ежегодно")
@@ -253,6 +258,7 @@ class ForecastReporter(BaseForecaster):
                     'Скорость (зап/с)': round(speed_samples_sec, 2),
                 })
                 self.accuracy_table.extend({**model_info, **row} for row in metrics)
+            self._save_mlp_diagnostics(validation_filename(dataset_name, target_var, split_year, final_year))
 
     def print_summary_table(self):
         """Отрисовывает финальную сводную таблицу результатов."""

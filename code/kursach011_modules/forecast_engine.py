@@ -19,6 +19,7 @@ from .forecast_metrics import (
     calculate_climatology_comparison, format_forecast_metrics, paired_predictions, station_month_climatology,
 )
 from .meteo_data import load_monthly_meteo
+from .mlp_diagnostics import MlpDiagnostics
 from .model_parameters import BEST_PARAMS, MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE, read_model_parameters
 from .project_settings import CRU_VERSION, cru_csv_path, forecast_filename, validation_filename
 from .monthly_features import (
@@ -75,10 +76,10 @@ def load_forecast_data(base_dir, dataset_name):
     return history
 
 
-def build_regressor(model_class, model_name, params):
+def build_regressor(model_class, model_name, params, *, seed=42):
     model_args = {}
     if model_name in ('Random Forest', 'MLP Neural Network'):
-        model_args['random_state'] = 42
+        model_args['random_state'] = seed
     if model_name in ('Random Forest', 'K-Neighbors'):
         model_args['n_jobs'] = -1
     return model_class(**params, **model_args)
@@ -138,6 +139,8 @@ class BaseForecaster:
         self.parameter_records = read_model_parameters(params_path)
         self.output_dir = Path(root_output_dir) / subfolder_name / 'csv_data'
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.diagnostics_dir = Path(root_output_dir) / 'mlp_diagnostics' / subfolder_name
+        self.mlp_diagnostics = MlpDiagnostics()
         self.model_classes = REGRESSORS.copy()
         print(f"[{self.__class__.__name__}] Инициализирован. Папка: {self.output_dir}")
         print(f"  Параметры моделей: {params_path if params_path.is_file() else 'BEST_PARAMS'}")
@@ -225,11 +228,21 @@ class BaseForecaster:
     def create_features(self, df):
         return create_time_features(df)
 
+    def _fit_regressor(self, model, X_train, y_train, df_test, target_var, dataset_name, *, mode=None):
+        date = df_test['Date'].iat[0] if isinstance(model, MLPRegressor) else None
+        self.mlp_diagnostics.fit(
+            model, X_train, y_train, date=date, mode=mode or self.forecast_mode, dataset=dataset_name, target=target_var,
+        )
+
+    def _save_mlp_diagnostics(self, filename):
+        self.mlp_diagnostics.save(self.diagnostics_dir / Path(filename).with_suffix('.json'))
+        self.mlp_diagnostics = MlpDiagnostics()
+
     def _fit_predict_model(self, df_train, df_test, model_name, target_var, dataset_name, *, y_train=None):
         params = self.model_parameters(model_name, target_var, dataset_name)
         model = build_regressor(self.model_classes[model_name], model_name, params)
         X_train, X_test, y_train = prepare_regression_inputs(df_train, df_test, target_var, y_train)
-        model.fit(X_train, y_train)
+        self._fit_regressor(model, X_train, y_train, df_test, target_var, dataset_name)
         return restore_regression_predictions(model.predict(X_test), target_var)
 
     def annual_model_splits(self, features, targets, test_years, model_name, target_var, dataset_name):
@@ -246,6 +259,7 @@ class StandardForecaster(BaseForecaster):
         super().__init__(base_dir, root_output_dir, "standard_forecast")
     
     def run(self, target_year, dataset_name):
+        self.mlp_diagnostics = MlpDiagnostics()
         df_full = self.load_data(dataset_name)
         climatology = None if df_full.empty else station_month_climatology(df_full, [target_year])
         forecast_dates = pd.date_range(f'{target_year}-01-01', periods=12, freq='MS')
@@ -302,6 +316,7 @@ class StandardForecaster(BaseForecaster):
                 metrics = calculate_climatology_comparison(results, climatology, target_var)
                 print(format_forecast_metrics(metrics, padding='    '))
             
+            self._save_mlp_diagnostics(fname)
             self._save_predictions(all_predictions, fname, dataset_name)
             print(f"  -> Сохранено: {fname}")
 
@@ -315,6 +330,7 @@ class LongTermValidator(BaseForecaster):
         super().__init__(base_dir, root_output_dir, "validation_results")
 
     def run(self, split_year, dataset_name, end_year=None):
+        self.mlp_diagnostics = MlpDiagnostics()
         df_full = self.load_data(dataset_name)
         if df_full.empty:
             return
@@ -367,5 +383,6 @@ class LongTermValidator(BaseForecaster):
                 metrics = calculate_climatology_comparison(results, climatology, target_var)
                 print(format_forecast_metrics(metrics, padding='      '))
 
+            self._save_mlp_diagnostics(fname)
             self._save_predictions(all_predictions, fname, dataset_name)
             print(f"  -> Результаты валидации сохранены в {fname}")

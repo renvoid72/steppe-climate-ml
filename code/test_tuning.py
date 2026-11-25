@@ -1,18 +1,27 @@
+from contextlib import redirect_stdout
+from io import StringIO
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
+import warnings
 
 import numpy as np
 import pandas as pd
+from sklearn.exceptions import ConvergenceWarning
 
 from kursach011_forecast_report import ForecastReporter
 from kursach011_modules.annual_forecast import ANNUAL_FORECAST_MODE
 from kursach011_modules.forecast_engine import LongTermValidator, StandardForecaster
+from kursach011_modules.mlp_check import MLP, RF, compare_releases, summarize_seeds
+from kursach011_modules.mlp_diagnostics import MlpDiagnostics
 from kursach011_modules.model_parameters import (
     BEST_PARAMS, MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE, read_model_parameters, save_model_parameters,
 )
-from kursach011_modules.tuning_lab import TUNING_YEARS, parameter_candidates, prepare_tuning_splits, select_parameters
+from kursach011_modules.tuning_lab import (
+    TUNING_YEARS, parameter_candidates, prepare_tuning_splits, select_parameters, tune_dataset,
+)
 
 
 def monthly_data(first_year, last_year):
@@ -74,6 +83,104 @@ class TuningTest(TestCase):
         self.assertEqual(result['score'], 0.)
         self.assertEqual(result['n_months'], 1)
         self.assertEqual(result['n_station_months'], 1)
+
+
+class MlpDiagnosticsTest(TestCase):
+    def setUp(self):
+        self.output = Path(self.enterContext(TemporaryDirectory()))
+        self.source = monthly_data(1985, 1989)
+        self.dataset = 'CRU_CEDA'
+        self.params = {'hidden_layer_sizes': (2,), 'max_iter': 1}
+        self.enterContext(redirect_stdout(StringIO()))
+
+    def test_diagnostics_written_by_forecasters_report_and_tuning(self):
+        updates = {
+            (mode, self.dataset, target, MLP): {'parameters': self.params}
+            for mode in (MONTHLY_FORECAST_MODE, ANNUAL_FORECAST_MODE) for target in ('DTR', 'Precip')
+        }
+        save_model_parameters(self.output / MODEL_PARAMS_FILENAME, updates)
+        monthly = StandardForecaster(self.output, self.output)
+        annual = LongTermValidator(self.output, self.output)
+        reporter = ForecastReporter(self.output, self.output)
+        for engine in (monthly, annual, reporter):
+            engine.model_classes = {MLP: engine.model_classes[MLP]}
+            self.enterContext(patch.object(engine, 'load_data', return_value=self.source))
+
+        tuning_dir = self.output / 'mlp_diagnostics' / 'tuning'
+        active = {target: {MLP: {'parameters': self.params}} for target in ('DTR', 'Precip')}
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', ConvergenceWarning)
+            monthly.run(1989, self.dataset)
+            annual.run(1989, self.dataset, end_year=1989)
+            reporter.run_standard_forecast_report(1989, self.dataset)
+            reporter.run_validation_report(1989, self.dataset, end_year=1989)
+            with patch('kursach011_modules.tuning_lab.BEST_PARAMS', {self.dataset: active}):
+                with patch('kursach011_modules.tuning_lab.parameter_candidates', return_value=[self.params]):
+                    tune_dataset(
+                        self.source, self.dataset, {}, ANNUAL_FORECAST_MODE, (1989,), active,
+                        diagnostics_dir=tuning_dir,
+                    )
+
+        files = [(engine.diagnostics_dir / name, mode, count) for engine, name, mode, count in (
+            (monthly, 'CRU_CEDA_DTR_1989.json', MONTHLY_FORECAST_MODE, 12),
+            (annual, 'Validation_CRU_CEDA_DTR_1989-1989.json', ANNUAL_FORECAST_MODE, 1),
+            (reporter, 'CRU_CEDA_DTR_1989.json', MONTHLY_FORECAST_MODE, 12),
+            (reporter, 'Validation_CRU_CEDA_DTR_1989-1989.json', ANNUAL_FORECAST_MODE, 1),
+        )]
+        files.append((tuning_dir / 'direct_annual_CRU_CEDA_DTR_1989-1989.json', ANNUAL_FORECAST_MODE, 1))
+        for path, mode, count in files:
+            with self.subTest(path=path):
+                record = json.loads(path.read_text(encoding='utf-8'))
+                self.assertEqual(record['summary'], {
+                    'fits': count, 'reached_limit': count, 'with_convergence_warning': count,
+                })
+                self.assertEqual(len(record['fits']), count)
+                first = record['fits'][0]
+                self.assertEqual(first['release'], '1989-01-01')
+                self.assertEqual(first['mode'], mode)
+                self.assertEqual(first['dataset'], self.dataset)
+                self.assertEqual(first['target'], 'DTR')
+                self.assertEqual(first['seed'], 42)
+                self.assertEqual(first['n_iter_'], 1)
+                self.assertEqual(first['max_iter'], 1)
+                self.assertTrue(first['convergence_warnings'])
+                self.assertEqual(len(first['loss_curve_']), 1)
+
+        cache_file = files[0][0]
+        original = cache_file.read_bytes()
+        with patch.object(monthly, '_fit_predict_model', side_effect=AssertionError('cache must be reused')):
+            monthly.run(1989, self.dataset)
+        self.assertEqual(cache_file.read_bytes(), original)
+
+    def test_short_check_uses_common_pairs_and_summarizes_only_active_seed_runs(self):
+        self.source.loc[self.source['Date'].eq('1989-06-01'), 'Precip'] = np.nan
+        diagnostics = MlpDiagnostics()
+        with patch('kursach011_modules.mlp_check.EPOCH_LIMITS', (1, 2)):
+            rows = compare_releases(
+                self.source, mode=ANNUAL_FORECAST_MODE, dataset=self.dataset, target='Precip',
+                releases=('1989-01-01',), active_params={
+                    MLP: {'parameters': self.params},
+                    RF: {'parameters': {'n_estimators': 2}},
+                }, diagnostics=diagnostics,
+            )
+
+        comparison = pd.DataFrame(rows)
+        self.assertEqual(len(comparison), 8)
+        self.assertEqual(len(diagnostics.fits), 4)
+        self.assertEqual(set(comparison['n_months']), {11})
+        self.assertEqual(set(comparison['n_station_months']), {11})
+        cap_one = comparison.loc[comparison['variant'].eq('epochs_1')].iloc[0]
+        active = comparison.loc[comparison['variant'].eq('active') & comparison['model'].eq(MLP)]
+        self.assertEqual(cap_one['regional_mae'], active.iloc[0]['regional_mae'])
+        summary = summarize_seeds(comparison)
+        self.assertEqual(len(summary), 4)
+        self.assertEqual(set(summary['num_seeds']), {3})
+        values = active['regional_mae'].to_numpy()
+        regional = summary.loc[summary['model'].eq(MLP) & summary['metric'].eq('regional_mae')].iloc[0]
+        self.assertAlmostEqual(regional['mean'], np.mean(values))
+        self.assertAlmostEqual(regional['std'], np.std(values, ddof=1))
+        self.assertAlmostEqual(regional['min'], min(values))
+        self.assertAlmostEqual(regional['max'], max(values))
 
 
 class ModelParametersTest(TestCase):
