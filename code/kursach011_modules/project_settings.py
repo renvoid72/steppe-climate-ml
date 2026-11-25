@@ -20,6 +20,10 @@ def results_dir(base_dir):
     return base_dir / 'output011_modules'
 
 
+def mlp_diagnostics_dir(base_dir):
+    return base_dir / 'diagnostics' / 'mlp'
+
+
 def forecast_filename(dataset_name, variable, year=ANALYSIS_YEAR):
     return f'{dataset_name}_{variable}_{year}.csv'
 

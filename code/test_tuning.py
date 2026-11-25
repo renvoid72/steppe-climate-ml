@@ -2,6 +2,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
@@ -12,6 +13,7 @@ import pandas as pd
 from sklearn.exceptions import ConvergenceWarning
 
 from kursach011_forecast_report import ForecastReporter
+from kursach011_modules import mlp_check, tuning_lab
 from kursach011_modules.annual_forecast import ANNUAL_FORECAST_MODE
 from kursach011_modules.forecast_engine import LongTermValidator, StandardForecaster
 from kursach011_modules.mlp_check import MLP, RF, compare_releases, summarize_seeds
@@ -19,9 +21,7 @@ from kursach011_modules.mlp_diagnostics import MlpDiagnostics
 from kursach011_modules.model_parameters import (
     BEST_PARAMS, MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE, read_model_parameters, save_model_parameters,
 )
-from kursach011_modules.tuning_lab import (
-    TUNING_YEARS, parameter_candidates, prepare_tuning_splits, select_parameters, tune_dataset,
-)
+from kursach011_modules.tuning_lab import TUNING_YEARS, parameter_candidates, prepare_tuning_splits, select_parameters
 
 
 def monthly_data(first_year, last_year):
@@ -87,7 +87,9 @@ class TuningTest(TestCase):
 
 class MlpDiagnosticsTest(TestCase):
     def setUp(self):
-        self.output = Path(self.enterContext(TemporaryDirectory()))
+        self.base_dir = Path(self.enterContext(TemporaryDirectory()))
+        self.output = self.base_dir / 'output011_modules'
+        self.diagnostics = self.base_dir / 'diagnostics' / 'mlp'
         self.source = monthly_data(1985, 1989)
         self.dataset = 'CRU_CEDA'
         self.params = {'hidden_layer_sizes': (2,), 'max_iter': 1}
@@ -99,14 +101,13 @@ class MlpDiagnosticsTest(TestCase):
             for mode in (MONTHLY_FORECAST_MODE, ANNUAL_FORECAST_MODE) for target in ('DTR', 'Precip')
         }
         save_model_parameters(self.output / MODEL_PARAMS_FILENAME, updates)
-        monthly = StandardForecaster(self.output, self.output)
-        annual = LongTermValidator(self.output, self.output)
-        reporter = ForecastReporter(self.output, self.output)
+        monthly = StandardForecaster(self.base_dir, self.output)
+        annual = LongTermValidator(self.base_dir, self.output)
+        reporter = ForecastReporter(self.base_dir, self.output)
         for engine in (monthly, annual, reporter):
             engine.model_classes = {MLP: engine.model_classes[MLP]}
             self.enterContext(patch.object(engine, 'load_data', return_value=self.source))
 
-        tuning_dir = self.output / 'mlp_diagnostics' / 'tuning'
         active = {target: {MLP: {'parameters': self.params}} for target in ('DTR', 'Precip')}
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', ConvergenceWarning)
@@ -114,21 +115,25 @@ class MlpDiagnosticsTest(TestCase):
             annual.run(1989, self.dataset, end_year=1989)
             reporter.run_standard_forecast_report(1989, self.dataset)
             reporter.run_validation_report(1989, self.dataset, end_year=1989)
-            with patch('kursach011_modules.tuning_lab.BEST_PARAMS', {self.dataset: active}):
-                with patch('kursach011_modules.tuning_lab.parameter_candidates', return_value=[self.params]):
-                    tune_dataset(
-                        self.source, self.dataset, {}, ANNUAL_FORECAST_MODE, (1989,), active,
-                        diagnostics_dir=tuning_dir,
-                    )
+            with (
+                patch.object(tuning_lab, 'BASE_DIR', self.base_dir),
+                patch.object(tuning_lab, 'BEST_PARAMS', {self.dataset: active}),
+                patch.dict(tuning_lab.TUNING_YEARS, {ANNUAL_FORECAST_MODE: (1989,)}),
+                patch.object(tuning_lab, 'load_forecast_data', return_value=self.source),
+                patch.object(tuning_lab, 'parameter_candidates', return_value=[self.params]),
+                patch.object(sys, 'argv', ['tuning_lab.py', '--mode', ANNUAL_FORECAST_MODE]),
+            ):
+                tuning_lab.main()
 
-        files = [(engine.diagnostics_dir / name, mode, count) for engine, name, mode, count in (
-            (monthly, 'CRU_CEDA_DTR_1989.json', MONTHLY_FORECAST_MODE, 12),
-            (annual, 'Validation_CRU_CEDA_DTR_1989-1989.json', ANNUAL_FORECAST_MODE, 1),
-            (reporter, 'CRU_CEDA_DTR_1989.json', MONTHLY_FORECAST_MODE, 12),
-            (reporter, 'Validation_CRU_CEDA_DTR_1989-1989.json', ANNUAL_FORECAST_MODE, 1),
-        )]
-        files.append((tuning_dir / 'direct_annual_CRU_CEDA_DTR_1989-1989.json', ANNUAL_FORECAST_MODE, 1))
-        for path, mode, count in files:
+        files = (
+            ('standard_forecast/CRU_CEDA_DTR_1989.json', MONTHLY_FORECAST_MODE, 12),
+            ('validation_results/Validation_CRU_CEDA_DTR_1989-1989.json', ANNUAL_FORECAST_MODE, 1),
+            ('forecast_report/CRU_CEDA_DTR_1989.json', MONTHLY_FORECAST_MODE, 12),
+            ('forecast_report/Validation_CRU_CEDA_DTR_1989-1989.json', ANNUAL_FORECAST_MODE, 1),
+            ('tuning/direct_annual_CRU_CEDA_DTR_1989-1989.json', ANNUAL_FORECAST_MODE, 1),
+        )
+        for name, mode, count in files:
+            path = self.diagnostics / name
             with self.subTest(path=path):
                 record = json.loads(path.read_text(encoding='utf-8'))
                 self.assertEqual(record['summary'], {
@@ -146,11 +151,45 @@ class MlpDiagnosticsTest(TestCase):
                 self.assertTrue(first['convergence_warnings'])
                 self.assertEqual(len(first['loss_curve_']), 1)
 
-        cache_file = files[0][0]
+        self.assertFalse((self.output / 'mlp_diagnostics').exists())
+        self.assertTrue((self.output / 'standard_forecast/csv_data/CRU_CEDA_DTR_1989.csv').is_file())
+        self.assertTrue((self.output / 'validation_results/csv_data/Validation_CRU_CEDA_DTR_1989-1989.csv').is_file())
+        records = read_model_parameters(self.output / MODEL_PARAMS_FILENAME)
+        self.assertEqual(records[ANNUAL_FORECAST_MODE][self.dataset]['DTR'][MLP]['selection'], 'tuning')
+        self.assertFalse((self.diagnostics / MODEL_PARAMS_FILENAME).exists())
+
+        cache_file = self.diagnostics / files[0][0]
         original = cache_file.read_bytes()
         with patch.object(monthly, '_fit_predict_model', side_effect=AssertionError('cache must be reused')):
             monthly.run(1989, self.dataset)
         self.assertEqual(cache_file.read_bytes(), original)
+
+    def test_short_check_default_and_explicit_output_directories(self):
+        config = self.output / MODEL_PARAMS_FILENAME
+        save_model_parameters(config, {
+            (MONTHLY_FORECAST_MODE, self.dataset, 'DTR', MLP): {'parameters': self.params},
+        })
+        original_config = config.read_bytes()
+        custom = self.base_dir / 'manual_check'
+        names = {'comparison.csv', 'seed_summary.csv', 'mlp_fits.json'}
+        locations = (
+            ([], self.diagnostics / 'short_check' / MONTHLY_FORECAST_MODE),
+            (['--output-dir', str(custom)], custom),
+        )
+        with (
+            patch.object(mlp_check, 'BASE_DIR', self.base_dir),
+            patch.object(mlp_check, 'load_forecast_data', return_value=monthly_data(2020, 2023)),
+            patch.object(mlp_check, 'EPOCH_LIMITS', (1, 2)),
+        ):
+            for options, directory in locations:
+                with patch.object(sys, 'argv', ['mlp_check.py', '--mode', MONTHLY_FORECAST_MODE, *options]):
+                    mlp_check.main()
+                self.assertEqual({path.name for path in directory.iterdir()}, names)
+                comparison = pd.read_csv(directory / 'comparison.csv')
+                self.assertEqual(set(comparison['mode']), {MONTHLY_FORECAST_MODE})
+
+        self.assertEqual({path.name for path in self.output.iterdir()}, {MODEL_PARAMS_FILENAME})
+        self.assertEqual(config.read_bytes(), original_config)
 
     def test_short_check_uses_common_pairs_and_summarizes_only_active_seed_runs(self):
         self.source.loc[self.source['Date'].eq('1989-06-01'), 'Precip'] = np.nan

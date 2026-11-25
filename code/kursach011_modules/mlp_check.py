@@ -19,7 +19,7 @@ from .forecast_engine import (
 from .forecast_metrics import calculate_forecast_metrics
 from .mlp_diagnostics import MlpDiagnostics
 from .model_parameters import FORECAST_MODES, MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE, read_model_parameters
-from .project_settings import results_dir
+from .project_settings import mlp_diagnostics_dir, results_dir
 from .tuning_lab import prepare_tuning_splits
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -112,9 +112,8 @@ def main():
     parser.add_argument('--output-dir', type=Path)
     args = parser.parse_args()
 
-    root = results_dir(BASE_DIR)
-    output = args.output_dir or root / 'mlp_diagnostics' / 'short_check' / args.mode
-    active = read_model_parameters(root / MODEL_PARAMS_FILENAME)
+    output = args.output_dir or mlp_diagnostics_dir(BASE_DIR) / 'short_check' / args.mode
+    active = read_model_parameters(results_dir(BASE_DIR) / MODEL_PARAMS_FILENAME)
     diagnostics = MlpDiagnostics()
     sources = {}
     results = []
