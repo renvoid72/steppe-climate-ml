@@ -19,6 +19,7 @@ from .forecast_engine import (
     CRU_SOURCE_VERSION, REGRESSORS, build_regressor, forecast_input_files, load_forecast_data, parameter_digest,
     prepare_regression_inputs, restore_regression_predictions,
 )
+from .mlp_diagnostics import MlpDiagnostics
 from .model_parameters import (
     BEST_PARAMS, FORECAST_MODES, MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE,
     read_model_parameters, save_model_parameters,
@@ -93,7 +94,7 @@ def prepare_tuning_splits(monthly, mode, years):
     return partial(monthly_tuning_splits, history, select_model_rows(forecasts), monthly, dates)
 
 
-def select_parameters(splits, target_var, model_name, candidates):
+def select_parameters(splits, target_var, model_name, candidates, *, fit_with_diagnostics=None):
     """Сравнивает региональные прогнозы кандидатов на общей выборке."""
     model_class = REGRESSORS[model_name]
     min_train_size = max(params.get('n_neighbors', 1) for params in candidates)
@@ -106,7 +107,10 @@ def select_parameters(splits, target_var, model_name, candidates):
         forecasts = {'Date': dates[observed], 'Fact': facts.ravel()[observed]}
         for index, params in enumerate(candidates):
             model = build_regressor(model_class, model_name, params)
-            model.fit(X_train, train_targets)
+            if fit_with_diagnostics is None:
+                model.fit(X_train, train_targets)
+            else:
+                fit_with_diagnostics(model, X_train, train_targets, date=test['Date'].iat[0])
             forecasts[index] = restore_regression_predictions(model.predict(X_test), target_var).ravel()[observed]
         results.append(pd.DataFrame(forecasts))
 
@@ -139,14 +143,22 @@ def tuning_data_source(base_dir, dataset_name):
     return {'sha256': checksums}
 
 
-def tune_dataset(monthly, dataset_name, source, mode, years, active_records):
+def tune_dataset(monthly, dataset_name, source, mode, years, active_records, *, diagnostics_dir):
     splits = prepare_tuning_splits(monthly, mode, years)
     results = {}
     for target_var, models in BEST_PARAMS[dataset_name].items():
         for model_name in models:
             print(f'{dataset_name} | {mode} | {target_var} | {model_name}', flush=True)
             candidates = parameter_candidates(model_name, active_records[target_var][model_name]['parameters'])
-            result = select_parameters(splits(target_var), target_var, model_name, candidates)
+            if model_name == 'MLP Neural Network':
+                diagnostics = MlpDiagnostics()
+                fit = partial(diagnostics.fit, mode=mode, dataset=dataset_name, target=target_var)
+                result = select_parameters(
+                    splits(target_var), target_var, model_name, candidates, fit_with_diagnostics=fit,
+                )
+                diagnostics.save(diagnostics_dir / f'{mode}_{dataset_name}_{target_var}_{years[0]}-{years[-1]}.json')
+            else:
+                result = select_parameters(splits(target_var), target_var, model_name, candidates)
             result.update(years=list(years), data_source=source)
             results[mode, dataset_name, target_var, model_name] = result
             print(f"  MAE={result['score']:.4f}, месяцев={result['n_months']}, пар={result['n_station_months']}")
@@ -160,6 +172,7 @@ def main():
     args = parser.parse_args()
     modes = FORECAST_MODES if args.mode == 'both' else (args.mode,)
     path = results_dir(BASE_DIR) / MODEL_PARAMS_FILENAME
+    diagnostics_dir = path.parent / 'mlp_diagnostics' / 'tuning'
     active_records = read_model_parameters(path)
     updates = {}
     for dataset_name in BEST_PARAMS:
@@ -170,7 +183,10 @@ def main():
         for mode in modes:
             years = TUNING_YEARS[mode]
             print(f'Подбор {mode} за {years[0]}–{years[-1]} гг.')
-            updates.update(tune_dataset(monthly, dataset_name, source, mode, years, active_records[mode][dataset_name]))
+            updates.update(tune_dataset(
+                monthly, dataset_name, source, mode, years, active_records[mode][dataset_name],
+                diagnostics_dir=diagnostics_dir,
+            ))
 
     save_model_parameters(path, updates)
     print(f'Параметры сохранены в {path}')
