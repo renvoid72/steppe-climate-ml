@@ -29,9 +29,11 @@ REPORT_FILE = RESULTS_DIR / "forecast_report.txt"
 # Добавляем путь к модулям проекта
 sys.path.append(str(PROJECT_DIR / "code"))
 
-from kursach011_modules.forecast_engine import BaseForecaster, BEST_PARAMS
+from kursach011_modules.forecast_engine import BaseForecaster, BEST_PARAMS, FORECAST_COLUMNS
 from kursach011_modules.annual_forecast import annual_prediction_rows, annual_targets, prepare_annual_features, print_monthly_errors
-from kursach011_modules.forecast_metrics import calculate_forecast_metrics, format_forecast_metrics, paired_predictions
+from kursach011_modules.forecast_metrics import (
+    calculate_climatology_comparison, format_forecast_metrics, paired_predictions, station_month_climatology,
+)
 from kursach011_modules.monthly_features import prepare_forecast_period, model_feature_columns, select_model_rows
 
 
@@ -127,6 +129,7 @@ class ForecastReporter(BaseForecaster):
         forecast_dates = pd.date_range(f'{target_year}-01-01', periods=12, freq='MS')
         history, forecast_rows = prepare_forecast_period(df_full, forecast_dates)
         eligible_forecasts = select_model_rows(forecast_rows)
+        climatology = station_month_climatology(df_full, [target_year])
         for target_var in ['DTR', 'Precip']:
             train_rows = select_model_rows(history, target_var)
             print(f"\n---> Параметр: {target_var} <---")
@@ -158,10 +161,12 @@ class ForecastReporter(BaseForecaster):
                     facts_map = dict(zip(facts_slice['WMO'], facts_slice[target_var]))
                     facts = df_pred['WMO'].map(facts_map).values
 
-                    results.append(pd.DataFrame({'Date': forecast_date, 'Fact': facts, 'Forecast': preds}))
+                    results.append(pd.DataFrame({
+                        'Date': forecast_date, 'WMO': df_pred['WMO'].to_numpy(), 'Fact': facts, 'Forecast': preds,
+                    }))
 
-                predictions = pd.concat(results) if results else pd.DataFrame(columns=['Date', 'Fact', 'Forecast'])
-                metrics = calculate_forecast_metrics(paired_predictions(predictions), target_var)
+                predictions = pd.concat(results) if results else pd.DataFrame(columns=FORECAST_COLUMNS)
+                metrics = calculate_climatology_comparison(predictions, climatology, target_var)
                 
                 speed_samples_sec = total_samples / total_predict_time if total_predict_time > 0 else 0.0
                 total_time = total_fit_time + total_predict_time
@@ -212,6 +217,7 @@ class ForecastReporter(BaseForecaster):
             return
 
         features = select_model_rows(prepare_annual_features(df_full, final_year))
+        climatology = station_month_climatology(df_full, test_years)
         for target_var in ['DTR', 'Precip']:
             targets = annual_targets(df_full, features, target_var)
             print(f"\n---> Параметр: {target_var} <---")
@@ -235,11 +241,11 @@ class ForecastReporter(BaseForecaster):
 
                     results.append(annual_prediction_rows(df_test, preds, facts, model_name, target_var))
 
-                predictions = pd.concat(results) if results else pd.DataFrame(columns=['Date', 'Fact', 'Forecast'])
+                predictions = pd.concat(results) if results else pd.DataFrame(columns=FORECAST_COLUMNS)
                 pairs = paired_predictions(predictions)
                 if results:
                     print_monthly_errors(pairs)
-                metrics = calculate_forecast_metrics(pairs, target_var)
+                metrics = calculate_climatology_comparison(predictions, climatology, target_var)
 
                 speed_samples_sec = total_samples / total_predict_time if total_predict_time > 0 else 0.0
                 total_time = total_fit_time + total_predict_time

@@ -12,7 +12,9 @@ import warnings
 from .annual_forecast import (
     ANNUAL_FORECAST_MODE, annual_prediction_rows, annual_splits, annual_targets, prepare_annual_features,
 )
-from .forecast_metrics import calculate_forecast_metrics, format_forecast_metrics, paired_predictions
+from .forecast_metrics import (
+    calculate_climatology_comparison, format_forecast_metrics, paired_predictions, station_month_climatology,
+)
 from .meteo_data import load_monthly_meteo
 from .project_settings import CRU_VERSION, cru_csv_path, forecast_filename, validation_filename
 from .monthly_features import (
@@ -30,6 +32,15 @@ HISTORY_POLICIES = {
     'CRU_CEDA': 'complete_features',
 }
 CRU_SOURCE_VERSION = f'CRU TS {CRU_VERSION}'
+
+
+def prepare_monthly_forecast_data(monthly, dataset_name):
+    """Приводит исходные месячные ряды к рабочему периоду и календарю прогноза."""
+    required_columns = ['Latitude', 'Longitude']
+    if dataset_name == 'CRU_CEDA':
+        required_columns.extend(['DTR', 'Precip'])
+    history = monthly.loc[monthly['Year'] >= 1960].dropna(subset=required_columns)
+    return history.assign(Date=pd.to_datetime(history[['Year', 'Month']].assign(day=1)))
 
 
 def mark_prediction_source(df, dataset_name):
@@ -123,14 +134,16 @@ class BaseForecaster:
             return df
         return None
 
-    def _report_cached_metrics(self, filename, dataset_name, target_var):
+    def _report_cached_metrics(self, filename, dataset_name, target_var, climatology):
         cached = self._load_cached_predictions(filename, dataset_name)
         if cached is None:
             return False
         print(f"  [SKIP] Файл {filename} уже существует и корректен.")
+        if climatology is None:
+            print("    Для сравнения с климатологией нужны исходные месячные ряды.")
         for model_name, rows in cached.groupby('Model', sort=False):
             print(f"    {model_name}")
-            metrics = calculate_forecast_metrics(paired_predictions(rows), target_var)
+            metrics = calculate_climatology_comparison(rows, climatology, target_var)
             print(format_forecast_metrics(metrics, padding='      '))
         return True
 
@@ -178,16 +191,8 @@ class BaseForecaster:
         else:
             raise ValueError("Неизвестный dataset_name")
 
-        df_monthly['Date'] = pd.to_datetime(df_monthly[['Year', 'Month']].assign(day=1))
-        
-        # Обрезка с 1960 года для корректности
-        df_monthly = df_monthly[df_monthly['Year'] >= 1960]
-        
-        required_columns = ['Latitude', 'Longitude']
-        if dataset_name == 'CRU_CEDA':
-            required_columns.extend(['DTR', 'Precip'])
-        df_monthly = df_monthly.dropna(subset=required_columns)
-        
+        df_monthly = prepare_monthly_forecast_data(df_monthly, dataset_name)
+
         print(f"    Загружено {len(df_monthly)} записей.")
         return df_monthly
 
@@ -232,19 +237,21 @@ class StandardForecaster(BaseForecaster):
         super().__init__(base_dir, root_output_dir, "standard_forecast")
     
     def run(self, target_year, dataset_name):
-        df_full = None
+        df_full = self.load_data(dataset_name)
+        climatology = None if df_full.empty else station_month_climatology(df_full, [target_year])
         forecast_dates = pd.date_range(f'{target_year}-01-01', periods=12, freq='MS')
-        
+        eligible_forecasts = None
+
         for target_var in ['DTR', 'Precip']:
             fname = forecast_filename(dataset_name, target_var, target_year)
-            
-            if self._report_cached_metrics(fname, dataset_name, target_var):
+
+            if self._report_cached_metrics(fname, dataset_name, target_var, climatology):
                 continue
 
-            if df_full is None:
-                df_full = self.load_data(dataset_name)
-                if df_full.empty:
-                    return
+            if df_full.empty:
+                continue
+
+            if eligible_forecasts is None:
                 history, forecast_rows = prepare_forecast_period(df_full, forecast_dates)
                 eligible_forecasts = select_model_rows(forecast_rows)
 
@@ -286,7 +293,7 @@ class StandardForecaster(BaseForecaster):
                 else:
                     print("    Нет строк для прогноза.")
 
-                metrics = calculate_forecast_metrics(pairs, target_var)
+                metrics = calculate_climatology_comparison(results, climatology, target_var)
                 print(format_forecast_metrics(metrics, padding='    '))
             
             self._save_predictions(all_predictions, fname, dataset_name)
@@ -310,10 +317,11 @@ class LongTermValidator(BaseForecaster):
         if not test_years:
             return
 
+        climatology = station_month_climatology(df_full, test_years)
         features = None
         for target_var in ['DTR', 'Precip']:
             fname = validation_filename(dataset_name, target_var, split_year, final_year)
-            if self._report_cached_metrics(fname, dataset_name, target_var):
+            if self._report_cached_metrics(fname, dataset_name, target_var, climatology):
                 continue
 
             if features is None:
@@ -350,7 +358,7 @@ class LongTermValidator(BaseForecaster):
 
                 pairs = paired_predictions(results)
                 print(f"      Месячных прогнозов: {len(results)}, пар с фактом: {len(pairs)}")
-                metrics = calculate_forecast_metrics(pairs, target_var)
+                metrics = calculate_climatology_comparison(results, climatology, target_var)
                 print(format_forecast_metrics(metrics, padding='      '))
 
             self._save_predictions(all_predictions, fname, dataset_name)
