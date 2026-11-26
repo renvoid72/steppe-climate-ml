@@ -13,9 +13,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import warnings
-from scipy.interpolate import griddata
-import xarray as xr
-from shapely.geometry import mapping
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -33,7 +30,7 @@ CORR_DIR = RESULTS_DIR / "cross_correlation_analysis"
 # Добавляем путь к коду в sys.path, чтобы импортировать BaseVisualizer
 sys.path.append(str(PROJECT_DIR / "code"))
 try:
-    from kursach011_modules.visualizer import BaseVisualizer
+    from kursach011_modules.visualizer import BaseVisualizer, MAP_GRID_STEP, interpolate_map, plot_interpolated_map
     HAS_VISUALIZER = True
 except ImportError as e:
     HAS_VISUALIZER = False
@@ -147,28 +144,20 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
 
     def plot_correlation_map(self, lats, lons, values, title, filename_base, season_name):
         """Интерполирует значения корреляции станций на регулярную сетку и строит карту в сезонной папке."""
-        # Определение границ сетки
+        valid = np.isfinite(lats) & np.isfinite(lons) & np.isfinite(values)
+        if not valid.any():
+            print(f'  Карта {filename_base} пропущена. Нет оценок с координатами станций.')
+            return
+        lats, lons, values = lats[valid], lons[valid], values[valid]
         lat_min, lat_max = lats.min() - 0.5, lats.max() + 0.5
         lon_min, lon_max = lons.min() - 0.5, lons.max() + 0.5
-        grid_lat, grid_lon = np.mgrid[lat_min:lat_max:0.05, lon_min:lon_max:0.05]
+        grid_lat, grid_lon = np.mgrid[lat_min:lat_max:MAP_GRID_STEP, lon_min:lon_max:MAP_GRID_STEP]
         points = np.column_stack((lats, lons))
-        
-        # Кубическая интерполяция
-        grid = griddata(points, values, (grid_lat, grid_lon), method='cubic')
-        grid = np.clip(grid, -1.0, 1.0)
-        
-        # Создание DataArray и обрезка по маске степей
-        da = xr.DataArray(
-            grid,
-            coords={'latitude': grid_lat[:, 0], 'longitude': grid_lon[0, :]},
-            dims=('latitude', 'longitude')
-        )
-        da.rio.write_crs("epsg:4326", inplace=True)
-        if self.mask is not None:
-            try:
-                da = da.rio.clip(self.mask.apply(mapping), da.rio.crs, drop=False)
-            except:
-                pass
+        da = interpolate_map(points, values, grid_lat, grid_lon).clip(min=-1, max=1)
+        vmin = -1.0 if min(values.min(), np.nanmin(da.values, initial=0)) < 0 else 0.0
+        da = self.clip_map(da, filename_base)
+        if da is None:
+            return
         
         # Отрисовка карты
         fig, ax = plt.subplots(figsize=(18, 6))
@@ -176,20 +165,14 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
         if self.world_map is not None:
             self.world_map.plot(ax=ax, color='#e0e0e0', edgecolor='white', linewidth=0.2, zorder=0)
             
-        # Устанавливаем границы шкалы: coolwarm центрируется на 0
-        vmin = 0.0 if np.nanmin(grid) >= 0 else -1.0
-        vmax = 1.0
-        
-        da.plot(ax=ax, cmap='coolwarm', vmin=vmin, vmax=vmax, add_colorbar=False, zorder=1, alpha=1.0)
+        im = plot_interpolated_map(ax, da, points, values, cmap='coolwarm', vmin=vmin, vmax=1.0)
         ax.grid(True, linestyle=':', alpha=0.4, color='black', linewidth=0.8, zorder=2)
         
         # Легенда
-        im = ax.collections[-1]
         cbar = plt.colorbar(im, ax=ax, fraction=0.015, pad=0.02, shrink=0.7)
         cbar.set_label("Коэффициент линейной корреляции Пирсона", fontsize=10)
         
         ax.set_title(title, fontsize=12, fontweight='bold', pad=10, wrap=True)
-        ax.set_xlabel("Долгота", fontsize=10)
         ax.set_ylabel("Широта", fontsize=10)
         
         # Ограничение видимой области по границам станций

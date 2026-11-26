@@ -5,6 +5,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib import patheffects
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 from matplotlib.text import Text
 from scipy.interpolate import griddata
 from scipy.spatial import QhullError
@@ -21,6 +23,11 @@ from .project_settings import (
 
 DATASETS = ('METEO_RU', 'CRU_CEDA')
 TARGETS = ('DTR', 'Precip')
+MAP_GRID_STEP = 0.05
+INTERPOLATION_CAPTION = (
+    'Заливка — кубическая интерполяция между исходными точками. '
+    f"Шаг сетки отображения — {str(MAP_GRID_STEP).replace('.', ',')}°"
+)
 
 try:
     import geopandas as gpd
@@ -54,6 +61,40 @@ MODEL_COLORS = {
     'MLP Neural Network': '#d62728'  
 }
 
+
+def interpolate_map(points, values, grid_lat, grid_lon, *, name=None):
+    valid = np.isfinite(points).all(axis=1) & np.isfinite(values)
+    grid = np.full(grid_lat.shape, np.nan)
+    if valid.sum() >= 3:
+        try:
+            grid = griddata(points[valid], values[valid], (grid_lat, grid_lon), method='cubic')
+        except QhullError:
+            # Совпадающие или коллинеарные точки можно показать маркерами.
+            pass
+    return xr.DataArray(
+        grid,
+        coords={'latitude': grid_lat[:, 0], 'longitude': grid_lon[0, :]},
+        dims=('latitude', 'longitude'),
+        name=name,
+    )
+
+
+def plot_interpolated_map(ax, da, points, values, *, cmap, vmin, vmax):
+    im = da.plot(ax=ax, cmap=cmap, vmin=vmin, vmax=vmax, add_colorbar=False, zorder=1)
+    valid = np.isfinite(points).all(axis=1) & np.isfinite(values)
+    ax.scatter(
+        points[valid, 1], points[valid, 0], c=values[valid], cmap=im.cmap, norm=im.norm,
+        edgecolors='#333333', linewidths=0.5, s=16, zorder=3,
+    )
+    caption = 'Долгота'
+    if np.isfinite(da.values).any():
+        caption += f'\n{INTERPOLATION_CAPTION}'
+    elif valid.any():
+        caption += '\nЗначения показаны в исходных точках'
+    ax.set_xlabel(caption, fontsize=10)
+    return im
+
+
 class BaseVisualizer:
     def __init__(self, base_dir, results_dir, subfolder_name):
         self.base_dir = Path(base_dir)
@@ -73,11 +114,14 @@ class BaseVisualizer:
         print(f"[{subfolder_name}] Инициализация визуализатора...")
         
         self.mask = None
+        self._mask_error = 'степная маска недоступна'
         self.world_map = None
         self._load_geo_data()
 
     def _load_geo_data(self):
-        if not HAS_GEO: return
+        if not HAS_GEO:
+            self._mask_error = 'недоступны GeoPandas, Shapely или rioxarray'
+            return
         
         shapefile = self.base_dir / "maps_countries" / "ne_10m_admin_0_countries.shp"
         if not shapefile.exists(): 
@@ -87,24 +131,33 @@ class BaseVisualizer:
         if not eco_file.exists():
             eco_file = self.base_dir / "maps" / "Ecoregions2017.shp"
 
-        if shapefile.exists():
-            try:
-                self.world_map = gpd.read_file(shapefile)
-            except: pass
+        try:
+            if not shapefile.is_file():
+                raise FileNotFoundError(f'не найден слой стран {shapefile.name}')
+            self.world_map = gpd.read_file(shapefile).to_crs('EPSG:4326')
+            if not eco_file.is_file():
+                raise FileNotFoundError(f'не найден слой экорегионов {eco_file.name}')
+            russia = self.world_map[self.world_map['NAME'].isin(['Russia', 'Russian Federation'])]
+            eco = gpd.read_file(eco_file)
+            biome_col = 'BIOME_NUM' if 'BIOME_NUM' in eco.columns else 'BIOME'
+            steppes = eco.loc[eco[biome_col] == 8].to_crs(russia.crs)
+            mask_gdf = gpd.overlay(steppes, russia, how='intersection')
+            if mask_gdf.empty:
+                raise ValueError('слои степей и границ России не дали общей геометрии')
+            self.mask = mask_gdf.geometry
+        except Exception as error:
+            self._mask_error = str(error)
 
-        if shapefile.exists() and eco_file.exists():
-            try:
-                countries = gpd.read_file(shapefile)
-                russia = countries[countries['NAME'].isin(['Russia', 'Russian Federation'])]
-                eco = gpd.read_file(eco_file)
-                biome_col = 'BIOME_NUM' if 'BIOME_NUM' in eco.columns else 'BIOME'
-                steppes = eco[eco[biome_col] == 8]
-                
-                if steppes.crs != russia.crs: steppes = steppes.to_crs(russia.crs)
-                mask_gdf = gpd.overlay(steppes, russia, how='intersection')
-                if not mask_gdf.empty:
-                    self.mask = mask_gdf.geometry
-            except: pass
+    def clip_map(self, da, filename):
+        if self.mask is None:
+            print(f'  Карта {filename} пропущена. Не удалось подготовить степную маску: {self._mask_error}')
+            return None
+        try:
+            da = da.rio.write_crs('EPSG:4326')
+            return da.rio.clip(self.mask.apply(mapping), self.mask.crs, drop=False)
+        except Exception as error:
+            print(f'  Карта {filename} пропущена. Ошибка обрезки по степной маске: {error}')
+            return None
 
     def _calculate_metrics(self, df, target_var):
         station_columns = ['WMO', 'Latitude', 'Longitude']
@@ -169,24 +222,13 @@ class BaseVisualizer:
         if metrics_df.empty:
             return
 
-        # 1. Сетка
         lat_min, lat_max = metrics_df['Latitude'].min() - 0.5, metrics_df['Latitude'].max() + 0.5
         lon_min, lon_max = metrics_df['Longitude'].min() - 0.5, metrics_df['Longitude'].max() + 0.5
-        
-        grid_lat, grid_lon = np.mgrid[lat_min:lat_max:0.05, lon_min:lon_max:0.05]
+        grid_lat, grid_lon = np.mgrid[lat_min:lat_max:MAP_GRID_STEP, lon_min:lon_max:MAP_GRID_STEP]
         has_estimate = np.isfinite(metrics_df[metric_name])
         scored = metrics_df.loc[has_estimate]
         unscored = metrics_df.loc[~has_estimate]
-        # В сетку попадают только точки с рассчитанной метрикой.
-        grid = np.full(grid_lat.shape, np.nan)
-        if len(scored) >= 3:
-            try:
-                grid = griddata(
-                    scored[['Latitude', 'Longitude']], scored[metric_name], (grid_lat, grid_lon), method='cubic',
-                )
-            except QhullError:
-                # При совпадающих или коллинеарных точках оценка остаётся видна на маркерах.
-                pass
+        points_only = seasonal and metric_name == 'Correlation'
 
         if metric_name == 'Correlation':
             cmap, vmin, vmax = 'coolwarm', -1, 1
@@ -194,27 +236,20 @@ class BaseVisualizer:
             cmap, vmin, vmax = 'RdYlGn', 0, 100
         else:
             cmap, vmin, vmax = 'viridis', None, None
-        if vmin is not None:
-            grid = np.clip(grid, vmin, vmax)
-        
         fig = None
         try:
-            # 3. Xarray
-            da = xr.DataArray(
-                grid,
-                coords={'latitude': grid_lat[:,0], 'longitude': grid_lon[0,:]},
-                dims=('latitude', 'longitude'),
-                name=metric_name
+            da = interpolate_map(
+                scored[['Latitude', 'Longitude']].to_numpy(), scored[metric_name].to_numpy(),
+                grid_lat, grid_lon, name=metric_name,
             )
-            da.rio.write_crs("epsg:4326", inplace=True)
-            
-            # Обрезка
-            if self.mask is not None:
-                try:
-                    da = da.rio.clip(self.mask.apply(mapping), da.rio.crs, drop=False)
-                except: pass
-            
-            da.to_netcdf(self.out_maps_nc / f"{filename_base}.nc")
+            if vmin is not None:
+                da = da.clip(min=vmin, max=vmax)
+            da = self.clip_map(da, f'{filename_base}.nc' if points_only else filename_base)
+            if da is None and not points_only:
+                return
+            if da is not None:
+                da.attrs.update(interpolation='cubic', grid_step_degrees=MAP_GRID_STEP)
+                da.to_netcdf(self.out_maps_nc / f"{filename_base}.nc")
             
             # --- 4. ОТРИСОВКА PNG (ФИНАЛЬНЫЙ СТИЛЬ) ---
             fig, ax = plt.subplots(figsize=(18, 6))
@@ -228,8 +263,11 @@ class BaseVisualizer:
                                   linewidth=0.2,         # <=== ЕЩЕ ТОНЬШЕ
                                   zorder=0)
             
-            # Г. ДАННЫЕ
-            im = da.plot(ax=ax, cmap=cmap, vmin=vmin, vmax=vmax, add_colorbar=False, zorder=1, alpha=1.0)
+            has_fill = not points_only and np.isfinite(da.values).any()
+            if has_fill:
+                im = da.plot(ax=ax, cmap=cmap, vmin=vmin, vmax=vmax, add_colorbar=False, zorder=1)
+            else:
+                im = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap=cmap)
             if not scored.empty:
                 ax.scatter(
                     scored['Longitude'], scored['Latitude'], c=scored[metric_name], cmap=im.cmap, norm=im.norm,
@@ -241,7 +279,7 @@ class BaseVisualizer:
                     edgecolors='white', linewidths=0.5, s=26, label='Нет оценки', zorder=4,
                 )
                 ax.legend(loc='lower left')
-            if not scored.empty and not np.isfinite(da.values).any():
+            if not points_only and not scored.empty and not has_fill:
                 ax.text(
                     0.99, 0.02, 'Значения показаны в точках станций', transform=ax.transAxes,
                     ha='right', va='bottom', fontsize=9,
@@ -263,10 +301,13 @@ class BaseVisualizer:
             ru_metric = RU_TITLES.get(metric_name, metric_name)
             
             title = f"{ru_metric}\n{ru_model} | {ru_var}\n{ru_dataset} {extra_info}"
-            if seasonal and metric_name == 'Correlation':
+            if points_only:
                 title += '\nДо трёх пар на станцию. При двух парах с изменяющимися рядами r = −1 или +1.'
             ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
-            ax.set_xlabel('Долгота\nЧисло у станции — количество пар «факт — прогноз»', fontsize=10)
+            xlabel = 'Долгота\nЧисло у станции — количество пар «факт — прогноз»'
+            if has_fill:
+                xlabel += f'\n{INTERPOLATION_CAPTION}'
+            ax.set_xlabel(xlabel, fontsize=10)
             ax.set_ylabel("Широта", fontsize=10)
             
             # Ж. ЗУМ
