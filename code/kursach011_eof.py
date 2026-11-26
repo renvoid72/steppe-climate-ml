@@ -20,9 +20,6 @@ import warnings
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.interpolate import griddata
-import xarray as xr
-from shapely.geometry import mapping
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
@@ -42,7 +39,7 @@ EOF_DIR = RESULTS_DIR / "eof_results"
 # Добавляем путь к коду, чтобы импортировать BaseVisualizer
 sys.path.append(str(PROJECT_DIR / "code"))
 try:
-    from kursach011_modules.visualizer import BaseVisualizer
+    from kursach011_modules.visualizer import BaseVisualizer, MAP_GRID_STEP, interpolate_map, plot_interpolated_map
     HAS_VISUALIZER = True
 except ImportError as e:
     HAS_VISUALIZER = False
@@ -378,13 +375,7 @@ def main():
     create_directories()
     
     # Инициализация визуализатора для загрузки гео-основы
-    if HAS_VISUALIZER:
-        viz = BaseVisualizer(base_dir=PROJECT_DIR, results_dir=RESULTS_DIR, subfolder_name="eof_results")
-        mask = viz.mask
-        world_map = viz.world_map
-    else:
-        mask = None
-        world_map = None
+    viz = BaseVisualizer(PROJECT_DIR, RESULTS_DIR, 'eof_results') if HAS_VISUALIZER else None
 
     # Конфигурация для расчётов ЕОФ по сезонам
     datasets_config = [
@@ -536,58 +527,49 @@ def main():
             plt.close()
             
             # Генерация карт пространственных мод
+            if viz is None:
+                continue
             png_dir = EOF_DIR / "maps_png" / s_name / item['dir_name'] / item['param']
             tiff_dir = EOF_DIR / "maps_tiff" / s_name / item['dir_name'] / item['param']
             
             lats = np.array([wmo_to_coords[wmo]['Latitude'] for wmo in anomalies_season.columns])
             lons = np.array([wmo_to_coords[wmo]['Longitude'] for wmo in anomalies_season.columns])
             
-            lat_min, lat_max = lats.min() - 0.5, lats.max() + 0.5
-            lon_min, lon_max = lons.min() - 0.5, lons.max() + 0.5
-            grid_lat, grid_lon = np.mgrid[lat_min:lat_max:0.05, lon_min:lon_max:0.05]
-            points = np.column_stack((lats, lons))
+            located = np.isfinite(lats) & np.isfinite(lons)
+            if not located.any():
+                continue
+            lat_min, lat_max = lats[located].min() - 0.5, lats[located].max() + 0.5
+            lon_min, lon_max = lons[located].min() - 0.5, lons[located].max() + 0.5
+            grid_lat, grid_lon = np.mgrid[lat_min:lat_max:MAP_GRID_STEP, lon_min:lon_max:MAP_GRID_STEP]
+            points = np.column_stack((lats[located], lons[located]))
+            clean_ds = item['title_ds'].replace(' ', '_')
+            saved_maps = 0
             
             for m in range(3):
                 eof_num = m + 1
-                vals = loadings[m]
-                
-                # Интерполяция
-                grid = griddata(points, vals, (grid_lat, grid_lon), method='cubic')
-                
-                da = xr.DataArray(
-                    grid,
-                    coords={'latitude': grid_lat[:, 0], 'longitude': grid_lon[0, :]},
-                    dims=('latitude', 'longitude')
-                )
-                da.rio.write_crs("epsg:4326", inplace=True)
-                
-                if mask is not None:
-                    try:
-                        da = da.rio.clip(mask.apply(mapping), da.rio.crs, drop=False)
-                    except:
-                        pass
-                
-                max_abs = np.nanmax(np.abs(da.values))
-                if np.isnan(max_abs) or max_abs == 0:
-                    max_abs = 1.0
+                vals = loadings[m][located]
+                file_name_base = f"Пространственная_мода_ЕОФ-{eof_num}_{clean_ds}_{item['title_param']}_{s_name}"
+                da = viz.clip_map(interpolate_map(points, vals, grid_lat, grid_lon), file_name_base)
+                if da is None:
+                    continue
+
+                max_abs = max(np.nanmax(np.abs(da.values), initial=0), np.nanmax(np.abs(vals), initial=0)) or 1.0
                 vmin, vmax = -max_abs, max_abs
                 
                 # Отрисовка карты
                 fig, ax = plt.subplots(figsize=(18, 6))
                 
-                if world_map is not None:
-                    world_map.plot(ax=ax, color='#e0e0e0', edgecolor='white', linewidth=0.2, zorder=0)
+                if viz.world_map is not None:
+                    viz.world_map.plot(ax=ax, color='#e0e0e0', edgecolor='white', linewidth=0.2, zorder=0)
                 
-                da.plot(ax=ax, cmap='coolwarm', vmin=vmin, vmax=vmax, add_colorbar=False, zorder=1, alpha=1.0)
+                im = plot_interpolated_map(ax, da, points, vals, cmap='coolwarm', vmin=vmin, vmax=vmax)
                 ax.grid(True, linestyle=':', alpha=0.4, color='black', linewidth=0.8, zorder=2)
                 
-                im = ax.collections[-1]
                 cbar = plt.colorbar(im, ax=ax, fraction=0.015, pad=0.02, shrink=0.7)
                 cbar.set_label("Нагрузка ЕОФ (безразм.)", fontsize=10)
                 
                 title = f"Пространственная мода ЕОФ-{eof_num} | Сезон: {s_info['name_ru']} | {item['title_ds']} | {item['title_param']}\nДоля объясненной дисперсии: {explained_var[m]:.2f}%"
                 ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
-                ax.set_xlabel("Долгота", fontsize=10)
                 ax.set_ylabel("Широта", fontsize=10)
                 
                 ax.set_xlim(lon_min - 10, lon_max + 15)
@@ -595,18 +577,15 @@ def main():
                 
                 plt.tight_layout()
                 
-                clean_ds = item['title_ds'].replace(" ", "_")
-                clean_param = item['title_param']
-                file_name_base = f"Пространственная_мода_ЕОФ-{eof_num}_{clean_ds}_{clean_param}_{s_name}"
-                
                 png_path = png_dir / f"{file_name_base}.png"
                 tiff_path = tiff_dir / f"{file_name_base}.tif"
                 
                 plt.savefig(png_path, dpi=200)
                 plt.savefig(tiff_path, dpi=300, format='tiff', pil_kwargs={'compression': 'tiff_lzw'})
                 plt.close()
+                saved_maps += 1
                 
-            print(f"        Сгенерированы 3 карты для {s_info['name_ru']}")
+            print(f"        {s_info['name_ru']}. Сохранено карт: {saved_maps}")
 
     # Шаг 3. Сохранение отчета по дисперсии
     print("\n3. Сохранение отчета по дисперсии...")

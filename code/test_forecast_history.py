@@ -471,6 +471,51 @@ class ForecastGraphTest(unittest.TestCase):
 
 
 class ForecastMapTest(unittest.TestCase):
+    def test_seasonal_pearson_skips_failed_masks_and_keeps_sparse_station_markers(self):
+        import geopandas as gpd
+        from matplotlib.collections import PathCollection, QuadMesh
+        from matplotlib.figure import Figure
+        from rioxarray.raster_array import RasterArray
+        from shapely.geometry import box
+
+        from kursach011_modules.visualizer import BaseVisualizer
+
+        metrics = pd.DataFrame({
+            'Latitude': [50., 51.], 'Longitude': [40., 41.], 'N_Pairs': [3, 2], 'Correlation': [0.5, -1.],
+        })
+
+        with TemporaryDirectory() as output:
+            visualizer = BaseVisualizer(output, output, 'maps_test')
+            rendered = {}
+
+            def capture_map(figure, path, **kwargs):
+                ax = figure.axes[0]
+                rendered[Path(path).name] = (ax.get_xlabel(), [type(item) for item in ax.collections])
+
+            def save(name):
+                visualizer._save_map_netcdf_and_png(
+                    metrics, 'Correlation', name, 'METEO_RU', 'DTR', 'K-Neighbors', seasonal=True,
+                )
+
+            messages = StringIO()
+            with patch.object(Figure, 'savefig', capture_map), redirect_stdout(messages):
+                save('missing_mask')
+                visualizer.mask = gpd.GeoSeries([box(39, 49, 42, 52)], crs='EPSG:4326')
+                with patch.object(RasterArray, 'clip', side_effect=ValueError('invalid geometry')):
+                    save('failed_clip')
+                save('sparse_stations')
+
+            self.assertIn('missing_mask', messages.getvalue())
+            self.assertIn('не найден слой стран', messages.getvalue())
+            self.assertIn('failed_clip', messages.getvalue())
+            self.assertIn('invalid geometry', messages.getvalue())
+            self.assertEqual(set(rendered), {'sparse_stations.png', 'sparse_stations.tif'})
+            self.assertEqual(list(visualizer.out_maps_nc.glob('*.nc')), [visualizer.out_maps_nc / 'sparse_stations.nc'])
+            for xlabel, collection_types in rendered.values():
+                self.assertNotIn('0,05°', xlabel)
+                self.assertIn(PathCollection, collection_types)
+                self.assertNotIn(QuadMesh, collection_types)
+
     def test_winter_maps_and_graph_use_december_from_the_previous_year(self):
         from kursach011_modules.visualizer import StandardForecastVisualizer
 
@@ -546,9 +591,12 @@ class ForecastMapTest(unittest.TestCase):
 
     def test_maps_use_available_pairs_and_show_counts_in_both_modes(self):
         import xarray as xr
+        import geopandas as gpd
+        from matplotlib.collections import PathCollection, QuadMesh
         from matplotlib.figure import Figure
         from matplotlib.text import Annotation
         from PIL import Image
+        from shapely.geometry import box
 
         from kursach011_modules.visualizer import StandardForecastVisualizer, ValidationVisualizer
 
@@ -559,12 +607,14 @@ class ForecastMapTest(unittest.TestCase):
             (6, 'B', 52, 40, 0., 1.),
             (7, 'B', 52, 40, 0., 2.),
             (8, 'B', 52, 40, 5., np.inf),
-            (6, 'C', 51, 41, np.nan, 1.),
+            (6, 'C', 51, 43.25, np.nan, 1.),
             (6, 'D', 50, 43, 0., 1.),
             (7, 'D', 50, 43, 5., 6.),
             (6, 'E', 52, 43, 5., 5.),
             (7, 'E', 52, 43, 6., 6.),
             (8, 'E', 52, 43, 7., 5.),
+            (6, 'F', 51, 44, 1., 5.),
+            (7, 'F', 51, 44, 5., 1.),
         ], columns=['Month', 'WMO', 'Latitude', 'Longitude', 'Fact', 'Forecast'])
         records = records.assign(Model='K-Neighbors', Forecast_Mode=ANNUAL_FORECAST_MODE)
         cases = (
@@ -573,27 +623,35 @@ class ForecastMapTest(unittest.TestCase):
             (ValidationVisualizer, validation_filename('METEO_RU', 'Precip'), 2020,
              'ValidMap_METEO_RU_Precip_K-Neighbors'),
         )
-        expected_counts = {(40, 50): '1', (40, 52): '2', (41, 51): '0', (43, 50): '2', (43, 52): '3'}
+        expected_counts = {(40, 50): '1', (40, 52): '2', (43.25, 51): '0', (43, 50): '2', (43, 52): '3', (44, 51): '2'}
         original_savefig = Figure.savefig
 
         for visualizer_class, filename, year, prefix in cases:
             with self.subTest(mode=visualizer_class.__name__), TemporaryDirectory() as output:
                 visualizer = visualizer_class(output, output)
+                visualizer.mask = gpd.GeoSeries([box(39, 49, 43.5, 53)], crs='EPSG:4326')
                 visualizer.csv_dir.mkdir()
                 dates = pd.to_datetime(records[['Month']].assign(Year=year, Day=1))
                 records.assign(Date=dates).to_csv(visualizer.csv_dir / filename, index=False)
                 rendered = {}
 
                 def capture_map(figure, path, **kwargs):
-                    if Path(path).parent == visualizer.out_maps_png:
+                    if Path(path).parent in (visualizer.out_maps_png, visualizer.out_maps_tiff):
                         ax = figure.axes[0]
-                        rendered[Path(path).stem] = (
+                        rendered[Path(path).name] = (
                             {text.xy: text.get_text() for text in ax.texts if isinstance(text, Annotation)},
                             {
                                 tuple(point) for collection in ax.collections if collection.get_label() == 'Нет оценки'
                                 for point in collection.get_offsets()
                             },
                             ' '.join([ax.get_title(), *(text.get_text() for text in ax.texts)]),
+                            ax.get_xlabel(),
+                            any(isinstance(collection, QuadMesh) for collection in ax.collections),
+                            {
+                                tuple(point): value for collection in ax.collections
+                                if isinstance(collection, PathCollection) and collection.get_array() is not None
+                                for point, value in zip(collection.get_offsets(), collection.get_array())
+                            },
                         )
                     return original_savefig(figure, path, **kwargs)
 
@@ -605,9 +663,9 @@ class ForecastMapTest(unittest.TestCase):
                     visualizer.run()
 
                 metrics = save_map.call_args_list[0].args[0].set_index('WMO').sort_index()
-                self.assertEqual(metrics['N_Pairs'].tolist(), [1, 2, 0, 2, 3])
-                np.testing.assert_allclose(metrics['Accuracy'], [100., 100., np.nan, 100., 100.])
-                np.testing.assert_allclose(metrics['Correlation'], [np.nan, np.nan, np.nan, 1., 0.], atol=1e-12)
+                self.assertEqual(metrics['N_Pairs'].tolist(), [1, 2, 0, 2, 3, 2])
+                np.testing.assert_allclose(metrics['Accuracy'], [100., 100., np.nan, 100., 100., 100.])
+                np.testing.assert_allclose(metrics['Correlation'], [np.nan, np.nan, np.nan, 1., 0., -1.], atol=1e-12)
 
                 for metric in ('Correlation', 'Accuracy'):
                     stem = f'{prefix}_{metric}'
@@ -615,15 +673,27 @@ class ForecastMapTest(unittest.TestCase):
                         self.assertEqual(png.format, 'PNG')
                     with Image.open(visualizer.out_maps_tiff / f'{stem}.tif') as tiff:
                         self.assertEqual(tiff.format, 'TIFF')
-                    counts, unscored, text = rendered[stem]
-                    self.assertEqual(counts, expected_counts)
-                    self.assertEqual(unscored, {(41, 51)} if metric == 'Accuracy' else {(40, 50), (40, 52), (41, 51)})
-                    self.assertEqual('До трёх пар' in text, metric == 'Correlation' and year == 2024)
-                    with xr.open_dataset(visualizer.out_maps_nc / f'{stem}.nc', decode_coords='all') as dataset:
-                        grid = dataset[metric].values
-                        finite = grid[np.isfinite(grid)]
+                    seasonal_pearson = metric == 'Correlation' and year == 2024
+                    for ext in ('png', 'tif'):
+                        counts, unscored, text, xlabel, has_fill, colored = rendered[f'{stem}.{ext}']
+                        self.assertEqual(counts, expected_counts)
+                        expected_unscored = {(43.25, 51)} if metric == 'Accuracy' else {(40, 50), (40, 52), (43.25, 51)}
+                        self.assertEqual(unscored, expected_unscored)
+                        self.assertEqual('До трёх пар' in text, seasonal_pearson)
+                        self.assertTrue(has_fill)
+                        self.assertIn('0,05°', xlabel)
                         if metric == 'Correlation':
-                            self.assertEqual(finite.size, 0)
-                        else:
-                            self.assertGreater(finite.size, 0)
+                            self.assertEqual(colored.keys(), {(43, 50), (43, 52), (44, 51)})
+                            np.testing.assert_allclose(list(colored.values()), [1., 0., -1.], atol=1e-12)
+                    with xr.open_dataset(visualizer.out_maps_nc / f'{stem}.nc', decode_coords='all') as dataset:
+                        grid = dataset[metric]
+                        finite = grid.values[np.isfinite(grid.values)]
+                        self.assertEqual(grid.attrs['interpolation'], 'cubic')
+                        self.assertEqual(grid.attrs['grid_step_degrees'], 0.05)
+                        self.assertTrue(grid.where(grid.longitude > 43.5, drop=True).isnull().all().item())
+                        self.assertGreater(finite.size, 0)
+                        self.assertTrue(grid.sel(latitude=51, longitude=43.25, method='nearest').notnull().item())
+                        if metric == 'Correlation':
+                            self.assertTrue(grid.sel(latitude=51, longitude=42, method='nearest').isnull().item())
+                        if metric == 'Accuracy':
                             np.testing.assert_allclose(finite, 100.)

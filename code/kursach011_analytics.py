@@ -15,9 +15,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import warnings
-from scipy.interpolate import griddata
-import xarray as xr
-from shapely.geometry import mapping
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -45,7 +42,7 @@ FORECAST_VALUE_COLUMNS = ['Fact', *FORECAST_MODELS]
 # Добавляем путь к коду в sys.path, чтобы импортировать BaseVisualizer
 sys.path.append(str(PROJECT_DIR / "code"))
 try:
-    from kursach011_modules.visualizer import BaseVisualizer
+    from kursach011_modules.visualizer import BaseVisualizer, MAP_GRID_STEP, interpolate_map, plot_interpolated_map
     HAS_VISUALIZER = True
 except ImportError as e:
     HAS_VISUALIZER = False
@@ -328,13 +325,13 @@ def generate_map_atlas(dataset_info):
 
     # Загружаем базовую гео-основу через BaseVisualizer (чтобы не читать файлы каждый раз)
     viz = BaseVisualizer(base_dir=PROJECT_DIR, results_dir=RESULTS_DIR, subfolder_name="analytics_reports")
-    mask = viz.mask
     world_map = viz.world_map
 
     total_maps = 0
 
     for key, info in dataset_info.items():
         pivoted_df = info['pivoted']
+        pivoted_df = pivoted_df.loc[np.isfinite(pivoted_df[['Latitude', 'Longitude']]).all(axis=1)]
         var = info['var']
         dataset = info['dataset']
         
@@ -356,7 +353,7 @@ def generate_map_atlas(dataset_info):
         # Определяем границы сетки по координатам всех станций этого датасета
         lat_min, lat_max = pivoted_df['Latitude'].min() - 0.5, pivoted_df['Latitude'].max() + 0.5
         lon_min, lon_max = pivoted_df['Longitude'].min() - 0.5, pivoted_df['Longitude'].max() + 0.5
-        grid_lat, grid_lon = np.mgrid[lat_min:lat_max:0.05, lon_min:lon_max:0.05]
+        grid_lat, grid_lon = np.mgrid[lat_min:lat_max:MAP_GRID_STEP, lon_min:lon_max:MAP_GRID_STEP]
 
         # Генерируем 13 срезов: 12 месяцев + 1 годовой
         for month_idx in range(1, 14):
@@ -379,59 +376,36 @@ def generate_map_atlas(dataset_info):
             points = df_slice[['Latitude', 'Longitude']].values
 
             # 2. Строим интерполированные гриды для Fact, RF, KNN, MLP
-            models_to_draw = ['Fact', 'Random Forest', 'K-Neighbors', 'MLP Neural Network']
-            grids = {}
+            maps = {}
+            ru_dataset_name = RU_DATASETS[dataset]
             
-            for m in models_to_draw:
-                vals = df_slice[m].values
-                # Кубическая интерполяция
-                grid = griddata(points, vals, (grid_lat, grid_lon), method='cubic')
-                # Ограничиваем снизу нулем только для осадков, так как для DTR допускаются любые значения
-                # (а кубическая интерполяция на осадках может давать отрицательные значения на резких градиентах).
+            for m in FORECAST_VALUE_COLUMNS:
+                vals = df_slice[m].to_numpy()
+                da = interpolate_map(points, vals, grid_lat, grid_lon)
                 if var == 'Precip':
-                    grid = np.clip(grid, 0, None)
-                
-                # Создаем xarray DataArray и обрезаем по маске
-                da = xr.DataArray(
-                    grid,
-                    coords={'latitude': grid_lat[:, 0], 'longitude': grid_lon[0, :]},
-                    dims=('latitude', 'longitude')
-                )
-                da.rio.write_crs("epsg:4326", inplace=True)
-                
-                if mask is not None:
-                    try:
-                        da = da.rio.clip(mask.apply(mapping), da.rio.crs, drop=False)
-                    except:
-                        pass
-                
-                grids[m] = da
+                    da = da.clip(min=0)
+                filename = f'{ru_dataset_name}_{ru_var_title}_{RU_MODELS_FILE[m]}_{slice_name}_{VALIDATION_END_YEAR}'
+                da = viz.clip_map(da, filename)
+                if da is not None:
+                    maps[m] = (filename, da, vals)
 
-            # 3. Рассчитываем общую динамическую шкалу (vmin, vmax) по всем 4 картам среза
-            all_values = [da.values for da in grids.values()]
-            vmin = np.nanmin(all_values)
-            vmax = np.nanmax(all_values)
-            
-            if np.isnan(vmin) or np.isnan(vmax):
-                vmin, vmax = 0, 1
-            else:
+            if not maps:
+                continue
+            # Общая шкала учитывает заливку и значения в исходных точках.
+            values = np.concatenate([np.r_[da.values.ravel(), vals] for _, da, vals in maps.values()])
+            finite = values[np.isfinite(values)]
+            vmin, vmax = 0, 1
+            if finite.size:
                 # Округлим для аккуратности
-                vmin = np.floor(vmin * 10) / 10
-                vmax = np.ceil(vmax * 10) / 10
+                vmin = np.floor(finite.min() * 10) / 10
+                vmax = np.ceil(finite.max() * 10) / 10
                 # Для осадков гарантируем vmin >= 0
                 if var == 'Precip':
                     vmin = max(0.0, vmin)
 
-            # 4. Отрисовка и сохранение каждой из 4 карт
-            for m in models_to_draw:
-                da = grids[m]
-                
-                model_file = RU_MODELS_FILE[m]
+            # 4. Отрисовка и сохранение карт
+            for m, (file_name_base, da, vals) in maps.items():
                 model_title = RU_MODELS_TITLE[m]
-                
-                # Имена файлов и заголовки полностью на русском
-                ru_dataset_name = RU_DATASETS[dataset]
-                file_name_base = f"{ru_dataset_name}_{ru_var_title}_{model_file}_{slice_name}_{VALIDATION_END_YEAR}"
                 
                 png_path = png_dir / f"{file_name_base}.png"
                 tiff_path = tiff_dir / f"{file_name_base}.tif"
@@ -444,16 +418,14 @@ def generate_map_atlas(dataset_info):
                 if world_map is not None:
                     world_map.plot(ax=ax, color='#e0e0e0', edgecolor='white', linewidth=0.2, zorder=0)
                 
-                da.plot(ax=ax, cmap=cmap, vmin=vmin, vmax=vmax, add_colorbar=False, zorder=1, alpha=1.0)
+                im = plot_interpolated_map(ax, da, points, vals, cmap=cmap, vmin=vmin, vmax=vmax)
                 ax.grid(True, linestyle=':', alpha=0.4, color='black', linewidth=0.8, zorder=2)
                 
                 # Добавляем легенду
-                im = ax.collections[-1]
                 cbar = plt.colorbar(im, ax=ax, fraction=0.015, pad=0.02, shrink=0.7)
                 cbar.set_label(var_label, fontsize=10)
                 
                 ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
-                ax.set_xlabel("Долгота", fontsize=10)
                 ax.set_ylabel("Широта", fontsize=10)
                 
                 # Зумируем маску
@@ -469,7 +441,7 @@ def generate_map_atlas(dataset_info):
                 
                 total_maps += 1
                 
-            print(f"   [{dataset} {var}] Готово для: {title_time} (4 карты)")
+            print(f"   [{dataset} {var}] {title_time}. Сохранено карт: {len(maps)}")
 
     print(f"\n   -> Атлас сгенерирован! Создано {total_maps} карт в форматах PNG и TIFF.")
 
