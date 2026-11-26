@@ -4,11 +4,13 @@ from contextlib import redirect_stdout
 from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
+import kursach011_modules.forecast_engine as forecast_engine
 from kursach011_modules.annual_forecast import ANNUAL_FORECAST_MODE, prepare_annual_features
 from kursach011_modules.forecast_engine import (
     CRU_SOURCE_VERSION, LongTermValidator, StandardForecaster, read_prediction_csv, read_validation_csv,
@@ -17,7 +19,7 @@ from kursach011_modules.forecast_metrics import (
     calculate_climatology_comparison, calculate_forecast_metrics, paired_predictions, station_month_climatology,
 )
 from kursach011_modules.monthly_features import create_forecast_features, prepare_forecast_period, select_model_rows
-from kursach011_modules.project_settings import forecast_filename, validation_filename
+from kursach011_modules.project_settings import cru_csv_path, forecast_filename, validation_filename
 
 
 class ForecastMetricsTest(unittest.TestCase):
@@ -124,6 +126,9 @@ class ForecastHistoryTest(unittest.TestCase):
         self.source['Latitude'] = 45.0
         self.source['Longitude'] = 60.0
         self.output_dir = self.enterContext(TemporaryDirectory())
+        self.cru = cru_csv_path(Path(self.output_dir))
+        self.cru.parent.mkdir(parents=True)
+        self.source.to_csv(self.cru, index=False)
 
     def use_knn(self, forecaster):
         forecaster.model_classes = {'K-Neighbors': forecaster.model_classes['K-Neighbors']}
@@ -189,6 +194,7 @@ class ForecastHistoryTest(unittest.TestCase):
 
     def test_meteo_forecast_cache_requires_calendar_coverage(self):
         forecaster = StandardForecaster(self.output_dir, self.output_dir)
+        hashes = {'Input_Data_Hash': 'data', 'Forecast_Code_Hash': 'code'}
         filename = 'METEO_RU_DTR_2024.csv'
         forecast = self.source.iloc[:1].assign(
             Forecast=10.0, Fact=10.0, Model='K-Neighbors', Target_Var='DTR',
@@ -196,9 +202,10 @@ class ForecastHistoryTest(unittest.TestCase):
         )
         forecast.to_csv(forecaster.output_dir / filename, index=False)
 
-        self.assertIsNone(forecaster._load_cached_predictions(filename, 'METEO_RU'))
-        forecaster._save_predictions([forecast], filename, 'METEO_RU')
-        self.assertIsNotNone(forecaster._load_cached_predictions(filename, 'METEO_RU'))
+        with self.assertRaisesRegex(ValueError, 'изменились правила отбора истории'):
+            forecaster._load_cached_predictions(filename, 'METEO_RU', 'DTR', hashes)
+        forecaster._save_predictions([forecast], filename, 'METEO_RU', hashes)
+        self.assertFalse(forecaster._load_cached_predictions(filename, 'METEO_RU', 'DTR', hashes).empty)
 
     def test_standard_forecast_replaces_legacy_cache_and_preserves_missing_facts(self):
         forecaster = StandardForecaster(self.output_dir, self.output_dir)
@@ -238,6 +245,10 @@ class ForecastHistoryTest(unittest.TestCase):
         self.assertEqual(cached_only.count('Для сравнения с климатологией нужны исходные месячные ряды.'), 2)
 
     def test_standard_forecast_can_cache_december_separately_from_the_calendar_year(self):
+        meteo_dir = Path(self.output_dir) / 'meteo_ru'
+        meteo_dir.mkdir()
+        (meteo_dir / 'all_steppe_data.txt').touch()
+        (meteo_dir / 'stations_coords.txt').touch()
         forecaster = StandardForecaster(self.output_dir, self.output_dir)
         self.use_knn(forecaster)
         for target in ('DTR', 'Precip'):
@@ -274,6 +285,7 @@ class ForecastHistoryTest(unittest.TestCase):
             'Year': dates.year, 'Month': dates.month,
         })
         data = pd.concat([data, data.loc[data['Date'] != '2024-06-01'].assign(WMO='B')])
+        data.to_csv(self.cru, index=False)
         old_file = validator.output_dir / 'Validation_CRU_CEDA_DTR_2024-2025.csv'
         legacy = data.iloc[:1].assign(
             Forecast=10.0, Fact=10.0, Model='Random Forest', Target_Var='DTR',
@@ -320,10 +332,12 @@ class ForecastHistoryTest(unittest.TestCase):
         np.testing.assert_array_equal(results['Forecast'], results['Date'].dt.month)
         replaced = read_validation_csv(old_file, 'CRU_CEDA')
         self.assertEqual(len(replaced), 48)
-        self.assertIsNotNone(validator._load_cached_predictions(old_file.name, 'CRU_CEDA'))
+        _, hashes = validator._load_data_and_hashes('CRU_CEDA')
+        self.assertFalse(validator._load_cached_predictions(old_file.name, 'CRU_CEDA', 'DTR', hashes).empty)
         mixed = pd.concat([replaced, legacy], ignore_index=True)
         mixed.to_csv(old_file, index=False)
-        self.assertIsNone(validator._load_cached_predictions(old_file.name, 'CRU_CEDA'))
+        with self.assertRaisesRegex(ValueError, 'пересчитайте валидацию'):
+            validator._load_cached_predictions(old_file.name, 'CRU_CEDA', 'DTR', hashes)
 
     def test_standard_forecast_handles_a_year_with_no_history(self):
         forecaster = StandardForecaster(self.output_dir, self.output_dir)
@@ -337,6 +351,7 @@ class ForecastHistoryTest(unittest.TestCase):
 
     def test_cru_cache_requires_current_source_version(self):
         validator = LongTermValidator(self.output_dir, self.output_dir)
+        hashes = {'Input_Data_Hash': 'data', 'Forecast_Code_Hash': 'code'}
         filename = validation_filename('CRU_CEDA', 'DTR')
         output = validator.output_dir / filename
         forecast = self.source.iloc[:1].assign(
@@ -347,12 +362,13 @@ class ForecastHistoryTest(unittest.TestCase):
         mixed = pd.concat([forecast.assign(Source_Version=CRU_SOURCE_VERSION), old_version], ignore_index=True)
         for stale in (forecast, old_version, mixed):
             stale.to_csv(output, index=False)
-            self.assertIsNone(validator._load_cached_predictions(filename, 'CRU_CEDA'))
+            with self.assertRaisesRegex(ValueError, 'требуется результат расчёта'):
+                validator._load_cached_predictions(filename, 'CRU_CEDA', 'DTR', hashes)
             with self.assertRaisesRegex(ValueError, 'требуется результат расчёта'):
                 read_prediction_csv(output, 'CRU_CEDA')
 
-        validator._save_predictions([forecast], filename, 'CRU_CEDA')
-        self.assertIsNotNone(validator._load_cached_predictions(filename, 'CRU_CEDA'))
+        validator._save_predictions([forecast], filename, 'CRU_CEDA', hashes)
+        self.assertFalse(validator._load_cached_predictions(filename, 'CRU_CEDA', 'DTR', hashes).empty)
         result = read_prediction_csv(output, 'CRU_CEDA')
         self.assertEqual(result['Source_Version'].tolist(), [CRU_SOURCE_VERSION])
 
@@ -396,6 +412,139 @@ class ForecastHistoryTest(unittest.TestCase):
                     ('METEO_RU', 'DTR'), ('CRU_CEDA', 'DTR'),
                 ])
                 self.assertEqual({call.args[3] for call in save_map.call_args_list}, {'METEO_RU', 'CRU_CEDA'})
+
+
+class ForecastCacheFreshnessTest(unittest.TestCase):
+    def setUp(self):
+        self.base = Path(self.enterContext(TemporaryDirectory()))
+        self.cru = cru_csv_path(self.base)
+        self.cru.parent.mkdir(parents=True)
+        dates = pd.date_range('2019-01-01', '2024-12-01', freq='MS')
+        self.monthly = pd.DataFrame({
+            'Year': dates.year, 'Month': dates.month, 'WMO': 'A',
+            'Latitude': 45.0, 'Longitude': 60.0, 'DTR': 8.0, 'Precip': 20.0,
+        })
+        self.monthly.to_csv(self.cru, index=False)
+        meteo_dir = self.base / 'meteo_ru'
+        meteo_dir.mkdir()
+        days = pd.date_range('2019-01-01', '2024-12-31', freq='D')
+        (meteo_dir / 'all_steppe_data.txt').write_text(
+            ''.join(f'A {day.year} {day.month} {day.day} 0 0 4 8 1\n' for day in days), encoding='utf-8',
+        )
+        self.coords = meteo_dir / 'stations_coords.txt'
+        self.coords.write_text('WMO Lat Lon\nA 45.0 60.0\n', encoding='utf-8')
+        self.enterContext(redirect_stdout(StringIO()))
+
+    def create_engines(self):
+        standard = StandardForecaster(self.base, self.base)
+        validator = LongTermValidator(self.base, self.base)
+        for engine in (standard, validator):
+            model = 'K-Neighbors'
+            engine.model_classes = {model: engine.model_classes[model]}
+            for dataset in ('CRU_CEDA', 'METEO_RU'):
+                for target in ('DTR', 'Precip'):
+                    engine.model_parameters(model, target, dataset)['n_neighbors'] = 1
+        return standard, validator
+
+    def run_engines(self, dataset, **kwargs):
+        standard, validator = self.create_engines()
+        log = StringIO()
+        with redirect_stdout(log):
+            standard.run(2024, dataset, **kwargs)
+            validator.run(2024, dataset, end_year=2024, **kwargs)
+        return SimpleNamespace(
+            log=log.getvalue(),
+            standard=standard.output_dir / forecast_filename(dataset, 'DTR', 2024),
+            annual=validator.output_dir / validation_filename(dataset, 'DTR', 2024, 2024),
+        )
+
+    def test_recalculates_after_input_changes_under_the_same_name(self):
+        initial = self.run_engines('CRU_CEDA')
+        self.run_engines('METEO_RU')
+        self.assertEqual(self.run_engines('CRU_CEDA').log.count('[SKIP]'), 4)
+
+        january = self.monthly['Year'].eq(2024) & self.monthly['Month'].eq(1)
+        self.monthly.loc[january, 'DTR'] = 18.0
+        self.monthly.to_csv(self.cru, index=False)
+        updated = self.run_engines('CRU_CEDA')
+        self.assertEqual(updated.log.count('изменились входные данные'), 4)
+        self.assertEqual(self.run_engines('METEO_RU').log.count('[SKIP]'), 4)
+        for path in (initial.standard, initial.annual):
+            rows = pd.read_csv(path)
+            self.assertEqual(rows.loc[rows['Date'].eq('2024-01-01'), 'Fact'].item(), 18.0)
+
+        self.coords.write_text('WMO Lat Lon\nA 46.0 60.0\n', encoding='utf-8')
+        updated_meteo = self.run_engines('METEO_RU')
+        self.assertEqual(updated_meteo.log.count('изменились входные данные'), 4)
+        self.assertEqual(self.run_engines('CRU_CEDA').log.count('[SKIP]'), 4)
+        for path in (updated_meteo.standard, updated_meteo.annual):
+            self.assertTrue(pd.read_csv(path)['Latitude'].eq(46.0).all())
+
+    def test_recalculates_after_code_change_or_when_forced(self):
+        source = self.base / 'monthly_features.py'
+        source.write_text('LAG = 1\n', encoding='utf-8')
+        before = forecast_engine.files_digest((source,))
+        with patch.object(forecast_engine, 'FORECAST_CODE_HASH', before):
+            result = self.run_engines('CRU_CEDA')
+            self.assertEqual(self.run_engines('CRU_CEDA').log.count('[SKIP]'), 4)
+            self.assertEqual(pd.read_csv(result.standard)['Forecast_Code_Hash'].iat[0], before)
+
+        source.write_text('LAG = 2\n', encoding='utf-8')
+        after = forecast_engine.files_digest((source,))
+        self.assertNotEqual(before, after)
+        with patch.object(forecast_engine, 'FORECAST_CODE_HASH', after):
+            recalculated = self.run_engines('CRU_CEDA')
+            self.assertEqual(recalculated.log.count('изменился код расчёта'), 4)
+            self.assertEqual(pd.read_csv(result.standard)['Forecast_Code_Hash'].iat[0], after)
+            forced = self.run_engines('CRU_CEDA', force=True)
+            self.assertEqual(forced.log.count('задан --force'), 4)
+            self.assertNotIn('[SKIP]', forced.log)
+
+    def test_recalculates_legacy_csv_once(self):
+        initial = self.run_engines('CRU_CEDA')
+        for path in (initial.standard, initial.annual):
+            pd.read_csv(path).drop(columns=['Input_Data_Hash', 'Forecast_Code_Hash']).to_csv(path, index=False)
+
+        updated = self.run_engines('CRU_CEDA')
+        self.assertEqual(updated.log.count('в CSV отсутствует поле Input_Data_Hash'), 2)
+        self.assertEqual(updated.log.count('[SKIP]'), 2)
+        self.assertEqual(self.run_engines('CRU_CEDA').log.count('[SKIP]'), 4)
+
+    def test_main_forces_all_csv_and_passes_the_available_validation_period_to_maps(self):
+        import kursach011
+        from kursach011_modules.visualizer import ValidationVisualizer
+
+        self.monthly.loc[self.monthly['Year'].le(2023)].to_csv(self.cru, index=False)
+        standard, validator = self.create_engines()
+        old_path = validator.output_dir / validation_filename('CRU_CEDA', 'DTR', 2022, 2024)
+        old_path.touch()
+        with (
+            patch.object(kursach011, 'PROJECT_DIR', self.base),
+            patch.object(kursach011, 'RESULTS_DIR', self.base),
+            patch.object(kursach011, 'VALIDATION_START_YEAR', 2022),
+            patch.object(kursach011, 'VALIDATION_END_YEAR', 2024),
+            patch.object(kursach011, 'StandardForecaster', return_value=standard),
+            patch.object(kursach011, 'LongTermValidator', return_value=validator),
+            patch.object(kursach011, 'StandardForecastVisualizer'),
+            patch.object(kursach011, 'ValidationVisualizer') as visualizer,
+            redirect_stdout(StringIO()) as output,
+        ):
+            kursach011.main([])
+            output.truncate(0)
+            output.seek(0)
+            kursach011.main(['--force'])
+
+        log = output.getvalue()
+        self.assertEqual(log.count('задан --force'), 12)
+        self.assertNotIn('[SKIP]', log)
+        visualizer.return_value.run.assert_called_with(end_year_by_dataset={'METEO_RU': 2024, 'CRU_CEDA': 2023})
+
+        viz = ValidationVisualizer(self.base, self.base)
+        with patch('kursach011_modules.visualizer.read_validation_csv', wraps=read_validation_csv) as read_csv:
+            with patch.object(viz, '_plot_full_graph'), patch.object(viz, '_save_map_netcdf_and_png'):
+                viz.run(start_year=2022, end_year_by_dataset={'METEO_RU': 2024, 'CRU_CEDA': 2023})
+        self.assertTrue(any(call.args[0].name.endswith('2022-2023.csv') for call in read_csv.call_args_list))
+        self.assertFalse(any(call.args[0] == old_path for call in read_csv.call_args_list))
 
 
 class ForecastGraphTest(unittest.TestCase):

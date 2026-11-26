@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
-from hashlib import sha256
+from hashlib import file_digest, sha256
 
 import pandas as pd
 import numpy as np
@@ -20,7 +20,7 @@ from .forecast_metrics import (
 )
 from .meteo_data import load_monthly_meteo
 from .mlp_diagnostics import MlpDiagnostics
-from .model_parameters import BEST_PARAMS, MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE, read_model_parameters
+from .model_parameters import MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE, read_model_parameters
 from .project_settings import CRU_VERSION, cru_csv_path, forecast_filename, mlp_diagnostics_dir, validation_filename
 from .monthly_features import (
     prepare_forecast_period,
@@ -106,6 +106,27 @@ def parameter_digest(params):
     return sha256(serialized.encode('utf-8')).hexdigest()
 
 
+def files_digest(paths):
+    digest = sha256()
+    for path in paths:
+        with path.open('rb') as source:
+            digest.update(file_digest(source, 'sha256').digest())
+    return digest.hexdigest()
+
+
+# Хеш фиксируется при импорте, чтобы соответствовать загруженному коду.
+FORECAST_CODE_HASH = files_digest(
+    Path(__file__).with_name(name) for name in (
+        'forecast_engine.py', 'meteo_data.py', 'monthly_features.py', 'annual_forecast.py', 'mlp_diagnostics.py',
+    )
+)
+
+
+def input_file_state(paths):
+    states = [path.stat() for path in paths]
+    return [(state.st_ino, state.st_size, state.st_mtime_ns) for state in states]
+
+
 def mark_prediction_source(df, dataset_name):
     if dataset_name == 'CRU_CEDA':
         df['Source_Version'] = CRU_SOURCE_VERSION
@@ -153,42 +174,43 @@ class BaseForecaster:
         records = self.parameter_records[self.forecast_mode][dataset_name][target_var]
         return parameter_digest({name: record['parameters'] for name, record in records.items()})
 
-    def _load_cached_predictions(self, filename, dataset_name, *, target_var=None):
-        """Читает CSV, совместимый с настройками прогноза."""
-        try:
-            path = self.output_dir / filename
-            if self.forecast_mode == ANNUAL_FORECAST_MODE:
-                df = read_validation_csv(path, dataset_name)
-            else:
-                df = read_prediction_csv(path, dataset_name)
-        except (OSError, ValueError):
-            return None
-
-        if (
-            df.empty
-            or not set(FORECAST_COLUMNS).issubset(df.columns)
-            or 'History_Policy' not in df.columns
-            or not df['History_Policy'].eq(HISTORY_POLICIES[dataset_name]).all()
-        ):
-            return None
-        if target_var is None:
-            target_var = df['Target_Var'].iat[0]
-        if target_var not in BEST_PARAMS[dataset_name] or not df['Target_Var'].eq(target_var).all():
-            return None
-
-        expected = self._parameter_digest(dataset_name, target_var)
-        if 'Model_Params_Hash' in df.columns:
-            compatible = df['Model_Params_Hash'].eq(expected).all()
+    def _load_cached_predictions(self, filename, dataset_name, target_var, hashes):
+        """Читает совместимый CSV или сообщает причину пересчёта."""
+        path = self.output_dir / filename
+        if self.forecast_mode == ANNUAL_FORECAST_MODE:
+            df = read_validation_csv(path, dataset_name)
         else:
-            # До появления JSON эти CSV строились на BEST_PARAMS.
-            compatible = expected == parameter_digest(BEST_PARAMS[dataset_name][target_var])
-        return df if compatible else None
+            df = read_prediction_csv(path, dataset_name)
 
-    def _report_cached_metrics(self, filename, dataset_name, target_var, climatology):
-        cached = self._load_cached_predictions(filename, dataset_name, target_var=target_var)
-        if cached is None:
+        if df.empty or not set(FORECAST_COLUMNS).issubset(df.columns):
+            raise ValueError('CSV пуст или отсутствуют обязательные колонки')
+        expected_values = (
+            ('History_Policy', HISTORY_POLICIES[dataset_name], 'изменились правила отбора истории'),
+            ('Target_Var', target_var, 'в CSV указан другой показатель'),
+            ('Input_Data_Hash', hashes['Input_Data_Hash'], 'изменились входные данные'),
+            ('Forecast_Code_Hash', hashes['Forecast_Code_Hash'], 'изменился код расчёта'),
+            ('Model_Params_Hash', self._parameter_digest(dataset_name, target_var), 'изменились параметры моделей'),
+        )
+        for column, expected, reason in expected_values:
+            if column not in df.columns:
+                raise ValueError(f'в CSV отсутствует поле {column}')
+            if not df[column].eq(expected).all():
+                raise ValueError(reason)
+        return df
+
+    def _report_cached_metrics(self, filename, dataset_name, target_var, climatology, hashes, *, force):
+        if force:
+            print(f'  [RUN] {filename}: задан --force.')
             return False
-        print(f"  [SKIP] Файл {filename} уже существует и корректен.")
+        try:
+            cached = self._load_cached_predictions(filename, dataset_name, target_var, hashes)
+        except FileNotFoundError:
+            print(f'  [RUN] {filename}: CSV отсутствует.')
+            return False
+        except (OSError, ValueError) as error:
+            print(f'  [RUN] {filename}: {error}')
+            return False
+        print(f'  [SKIP] {filename}: используется актуальный CSV.')
         if climatology is None:
             print("    Для сравнения с климатологией нужны исходные месячные ряды.")
         for model_name, rows in cached.groupby('Model', sort=False):
@@ -197,8 +219,9 @@ class BaseForecaster:
             print(format_forecast_metrics(metrics, padding='      '))
         return True
 
-    def _save_predictions(self, predictions, filename, dataset_name):
+    def _save_predictions(self, predictions, filename, dataset_name, hashes):
         df = pd.concat(predictions) if predictions else pd.DataFrame(columns=FORECAST_COLUMNS)
+        df = df.assign(**hashes)
         df['History_Policy'] = HISTORY_POLICIES[dataset_name]
         df['Model_Params_Hash'] = ''
         if not df.empty:
@@ -224,6 +247,18 @@ class BaseForecaster:
 
     def load_data(self, dataset_name):
         return load_forecast_data(self.base_dir, dataset_name)
+
+    def _load_data_and_hashes(self, dataset_name):
+        paths = forecast_input_files(self.base_dir, dataset_name)
+        initial_state = input_file_state(paths)
+        hashes = {
+            'Input_Data_Hash': files_digest(paths),
+            'Forecast_Code_Hash': FORECAST_CODE_HASH,
+        }
+        data = self.load_data(dataset_name)
+        if input_file_state(paths) != initial_state:
+            raise ValueError(f'{dataset_name}: входные файлы изменились при загрузке. Повторите запуск.')
+        return data, hashes
 
     def create_features(self, df):
         return create_time_features(df)
@@ -258,9 +293,9 @@ class StandardForecaster(BaseForecaster):
     def __init__(self, base_dir, root_output_dir):
         super().__init__(base_dir, root_output_dir, "standard_forecast")
     
-    def run(self, target_year, dataset_name, *, target_month=None):
+    def run(self, target_year, dataset_name, *, target_month=None, force=False):
         self.mlp_diagnostics = MlpDiagnostics()
-        df_full = self.load_data(dataset_name)
+        df_full, hashes = self._load_data_and_hashes(dataset_name)
         climatology = None if df_full.empty else station_month_climatology(df_full, [target_year])
         period = str(target_year) if target_month is None else f'{target_year}-{target_month:02d}'
         forecast_dates = pd.date_range(period, periods=12 if target_month is None else 1, freq='MS')
@@ -269,11 +304,11 @@ class StandardForecaster(BaseForecaster):
         for target_var in ['DTR', 'Precip']:
             fname = forecast_filename(dataset_name, target_var, target_year, month=target_month)
 
-            if self._report_cached_metrics(fname, dataset_name, target_var, climatology):
+            if self._report_cached_metrics(fname, dataset_name, target_var, climatology, hashes, force=force):
                 continue
 
             if df_full.empty:
-                continue
+                raise ValueError(f'{dataset_name}: нет месячных рядов для пересчёта {fname}.')
 
             if eligible_forecasts is None:
                 history, forecast_rows = prepare_forecast_period(df_full, forecast_dates)
@@ -318,7 +353,7 @@ class StandardForecaster(BaseForecaster):
                 print(format_forecast_metrics(metrics, padding='    '))
             
             self._save_mlp_diagnostics(fname)
-            self._save_predictions(all_predictions, fname, dataset_name)
+            self._save_predictions(all_predictions, fname, dataset_name, hashes)
             print(f"  -> Сохранено: {fname}")
 
 # ============================================================================
@@ -330,21 +365,23 @@ class LongTermValidator(BaseForecaster):
     def __init__(self, base_dir, root_output_dir):
         super().__init__(base_dir, root_output_dir, "validation_results")
 
-    def run(self, split_year, dataset_name, end_year=None):
+    def run(self, split_year, dataset_name, end_year=None, *, force=False):
         self.mlp_diagnostics = MlpDiagnostics()
-        df_full = self.load_data(dataset_name)
+        df_full, hashes = self._load_data_and_hashes(dataset_name)
         if df_full.empty:
+            print(f'  {dataset_name}: нет месячных рядов для валидации.')
             return
         final_year = min(end_year, df_full['Year'].max()) if end_year is not None else df_full['Year'].max()
         test_years = range(split_year, final_year + 1)
         if not test_years:
+            print(f'  {dataset_name}: нет данных за запрошенный период валидации.')
             return
 
         climatology = station_month_climatology(df_full, test_years)
         features = None
         for target_var in ['DTR', 'Precip']:
             fname = validation_filename(dataset_name, target_var, split_year, final_year)
-            if self._report_cached_metrics(fname, dataset_name, target_var, climatology):
+            if self._report_cached_metrics(fname, dataset_name, target_var, climatology, hashes, force=force):
                 continue
 
             if features is None:
@@ -385,5 +422,6 @@ class LongTermValidator(BaseForecaster):
                 print(format_forecast_metrics(metrics, padding='      '))
 
             self._save_mlp_diagnostics(fname)
-            self._save_predictions(all_predictions, fname, dataset_name)
+            self._save_predictions(all_predictions, fname, dataset_name, hashes)
             print(f"  -> Результаты валидации сохранены в {fname}")
+        return final_year
