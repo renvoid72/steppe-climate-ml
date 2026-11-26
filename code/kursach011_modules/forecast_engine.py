@@ -258,15 +258,16 @@ class StandardForecaster(BaseForecaster):
     def __init__(self, base_dir, root_output_dir):
         super().__init__(base_dir, root_output_dir, "standard_forecast")
     
-    def run(self, target_year, dataset_name):
+    def run(self, target_year, dataset_name, *, target_month=None):
         self.mlp_diagnostics = MlpDiagnostics()
         df_full = self.load_data(dataset_name)
         climatology = None if df_full.empty else station_month_climatology(df_full, [target_year])
-        forecast_dates = pd.date_range(f'{target_year}-01-01', periods=12, freq='MS')
+        period = str(target_year) if target_month is None else f'{target_year}-{target_month:02d}'
+        forecast_dates = pd.date_range(period, periods=12 if target_month is None else 1, freq='MS')
         eligible_forecasts = None
 
         for target_var in ['DTR', 'Precip']:
-            fname = forecast_filename(dataset_name, target_var, target_year)
+            fname = forecast_filename(dataset_name, target_var, target_year, month=target_month)
 
             if self._report_cached_metrics(fname, dataset_name, target_var, climatology):
                 continue
@@ -278,7 +279,7 @@ class StandardForecaster(BaseForecaster):
                 history, forecast_rows = prepare_forecast_period(df_full, forecast_dates)
                 eligible_forecasts = select_model_rows(forecast_rows)
 
-            print(f"\n>>> Стандартный прогноз: {target_var} на {target_year} ({dataset_name}) <<<")
+            print(f"\n>>> Стандартный прогноз: {target_var} на {period} ({dataset_name}) <<<")
             all_predictions = []
             train_rows = select_model_rows(history, target_var)
             

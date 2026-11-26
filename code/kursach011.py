@@ -31,8 +31,9 @@ def main():
     
     # Standard Forecast
     forecaster = StandardForecaster(base_dir=PROJECT_DIR, root_output_dir=RESULTS_DIR)
-    forecaster.run(target_year=ANALYSIS_YEAR, dataset_name='METEO_RU')
-    forecaster.run(target_year=ANALYSIS_YEAR, dataset_name='CRU_CEDA')
+    for dataset in ('METEO_RU', 'CRU_CEDA'):
+        forecaster.run(target_year=ANALYSIS_YEAR, dataset_name=dataset)
+        forecaster.run(target_year=ANALYSIS_YEAR - 1, dataset_name=dataset, target_month=12)
     
     # Validation
     validator = LongTermValidator(base_dir=PROJECT_DIR, root_output_dir=RESULTS_DIR)

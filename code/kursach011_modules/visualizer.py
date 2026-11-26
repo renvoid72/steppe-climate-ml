@@ -322,9 +322,48 @@ class StandardForecastVisualizer(BaseVisualizer):
     def __init__(self, base_dir, results_dir):
         super().__init__(base_dir, results_dir, "standard_forecast")
 
+    def _plot_season_maps(self, rows, dataset, var, season, period, title):
+        for model, forecasts in rows.groupby('Model', sort=False):
+            metrics = self._calculate_metrics(forecasts, var)
+            for metric in ('Correlation', 'Accuracy'):
+                filename = f"{dataset}_{var}_{model}_{period}_{season}_{metric}"
+                self._save_map_netcdf_and_png(
+                    metrics, metric, filename, dataset, var, model, title, seasonal=True,
+                )
+
+    def _plot_winter(self, year_rows, dataset, var, year):
+        previous_year = year - 1
+        december_file = self.csv_dir / forecast_filename(dataset, var, previous_year, month=12)
+        if not december_file.is_file():
+            december_file = self.csv_dir / forecast_filename(dataset, var, previous_year)
+        if not december_file.is_file():
+            print(f"  {dataset} / {var}: нет прогноза за декабрь {previous_year}, зима пропущена.")
+            return
+
+        previous_rows = read_prediction_csv(december_file, dataset)
+        previous_rows['Date'] = pd.to_datetime(previous_rows['Date'])
+        winter_months = pd.period_range(f'{previous_year}-12', periods=3, freq='M')
+        december_rows = previous_rows.loc[previous_rows['Date'].dt.to_period('M').eq(winter_months[0])]
+        jan_feb_rows = year_rows.loc[year_rows['Date'].dt.to_period('M').isin(winter_months[1:])]
+        winter = pd.concat([december_rows, jan_feb_rows], ignore_index=True)
+
+        months_by_model = winter['Date'].dt.to_period('M').groupby(winter['Model']).nunique()
+        complete_models = months_by_model.index[months_by_model.eq(len(winter_months))]
+        year_models = pd.Index(year_rows['Model'].dropna().unique())
+        for model in year_models.difference(complete_models, sort=False):
+            print(f"  {dataset} / {var} / {model}: неполный набор зимних месяцев, зима пропущена.")
+        winter = winter.loc[winter['Model'].isin(complete_models)]
+        if winter.empty:
+            return
+
+        period = f'{previous_year}-{year}'
+        title = f'Зима {previous_year}/{year % 100:02d} (декабрь {previous_year} — февраль {year})'
+        self._plot_full_graph(winter, dataset, var, title, f'Graph_{dataset}_{var}_{period}_Winter')
+        self._plot_season_maps(winter, dataset, var, 'Winter', period, f'\n{title}')
+
     def run(self, year=ANALYSIS_YEAR):
         print("\n--- [Viz] Стандартный Прогноз (Сезонные карты) ---")
-        seasons = {'Winter': [12, 1, 2], 'Spring': [3, 4, 5], 'Summer': [6, 7, 8], 'Autumn': [9, 10, 11]}
+        seasons = {'Spring': [3, 4, 5], 'Summer': [6, 7, 8], 'Autumn': [9, 10, 11]}
 
         for dataset, var in product(DATASETS, TARGETS):
             f = self.csv_dir / forecast_filename(dataset, var, year)
@@ -340,19 +379,12 @@ class StandardForecastVisualizer(BaseVisualizer):
                     continue
 
                 self._plot_full_graph(df, dataset, var, year, f"Graph_{dataset}_{var}_{year}")
-                
-                for model in df['Model'].unique():
-                    df_mod = df[df['Model'] == model]
-                    for s_name, months in seasons.items():
-                        df_seas = df_mod[df_mod['Date'].dt.month.isin(months)]
-                        if df_seas.empty: continue
-                        metrics = self._calculate_metrics(df_seas, var)
-                        ru_season = RU_TITLES.get(s_name, s_name)
-                        for met in ['Correlation', 'Accuracy']:
-                            fname = f"{dataset}_{var}_{model}_{year}_{s_name}_{met}"
-                            self._save_map_netcdf_and_png(
-                                metrics, met, fname, dataset, var, model, f"({ru_season} {year})", seasonal=True,
-                            )
+
+                for season, months in seasons.items():
+                    season_rows = df.loc[df['Date'].dt.month.isin(months)]
+                    title = f"({RU_TITLES[season]} {year})"
+                    self._plot_season_maps(season_rows, dataset, var, season, year, title)
+                self._plot_winter(df, dataset, var, year)
             except Exception as e: print(f"  Ошибка: {e}")
 
 class ValidationVisualizer(BaseVisualizer):

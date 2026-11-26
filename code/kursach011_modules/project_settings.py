@@ -24,8 +24,9 @@ def mlp_diagnostics_dir(base_dir):
     return base_dir / 'diagnostics' / 'mlp'
 
 
-def forecast_filename(dataset_name, variable, year=ANALYSIS_YEAR):
-    return f'{dataset_name}_{variable}_{year}.csv'
+def forecast_filename(dataset_name, variable, year=ANALYSIS_YEAR, *, month=None):
+    period = str(year) if month is None else f'{year}-{month:02d}'
+    return f'{dataset_name}_{variable}_{period}.csv'
 
 
 def validation_filename(dataset_name, variable, start_year=VALIDATION_START_YEAR, end_year=VALIDATION_END_YEAR):

@@ -34,18 +34,50 @@ def monthly_data(first_year, last_year):
 
 
 class TuningTest(TestCase):
-    def test_monthly_tuning_uses_only_history_before_each_month_and_excludes_2024(self):
+    def test_monthly_tuning_uses_only_history_before_each_month_and_ends_in_november(self):
         data = monthly_data(2020, 2024)
         years = TUNING_YEARS[MONTHLY_FORECAST_MODE]
+        splits = prepare_tuning_splits(data, MONTHLY_FORECAST_MODE, years, last_month=11)
         dates_seen = []
-        for train, test, targets, facts, dates in prepare_tuning_splits(data, MONTHLY_FORECAST_MODE, years)('DTR'):
+        for train, test, targets, facts, dates in splits('DTR'):
             date = pd.Timestamp(dates.item())
             dates_seen.append(date)
             self.assertTrue((train['Date'] < date).all())
             self.assertTrue(test['DTR'].isna().all())
             self.assertIsNone(targets)
             self.assertEqual(facts.item(), date.year * 100. + date.month)
-        self.assertEqual(dates_seen, list(pd.date_range('2022-01-01', '2023-12-01', freq='MS')))
+        self.assertEqual(dates_seen, list(pd.date_range('2022-01-01', '2023-11-01', freq='MS')))
+
+    def test_monthly_tuning_replaces_old_selection_with_a_clean_run_through_november(self):
+        dataset, target, model = 'CRU_CEDA', 'DTR', 'K-Neighbors'
+        baseline = BEST_PARAMS[dataset][target][model]
+        old_record = {'parameters': {'n_neighbors': 4}, 'selection': 'tuning', 'years': [2022, 2023]}
+        annual_record = {'parameters': {'n_neighbors': 5}, 'selection': 'tuning', 'years': [1989]}
+        with TemporaryDirectory() as temp:
+            base_dir = Path(temp)
+            path = base_dir / 'output011_modules' / MODEL_PARAMS_FILENAME
+            save_model_parameters(path, {
+                (MONTHLY_FORECAST_MODE, dataset, target, model): old_record,
+                (ANNUAL_FORECAST_MODE, dataset, target, model): annual_record,
+            })
+            with (
+                patch.object(tuning_lab, 'BASE_DIR', base_dir),
+                patch.object(tuning_lab, 'BEST_PARAMS', {dataset: {target: {model: baseline}}}),
+                patch.object(tuning_lab, 'load_forecast_data', return_value=monthly_data(2017, 2024)),
+                patch.object(tuning_lab, 'parameter_candidates', return_value=[baseline]) as candidates,
+                patch.object(sys, 'argv', ['tuning_lab.py', '--mode', MONTHLY_FORECAST_MODE]),
+                redirect_stdout(StringIO()),
+            ):
+                tuning_lab.main()
+            records = read_model_parameters(path)
+
+        candidates.assert_called_once_with(model, baseline)
+        monthly_record = records[MONTHLY_FORECAST_MODE][dataset][target][model]
+        self.assertEqual(monthly_record['parameters'], baseline)
+        self.assertEqual(monthly_record['n_months'], 23)
+        self.assertEqual(monthly_record['start_month'], '2022-01')
+        self.assertEqual(monthly_record['end_month'], '2023-11')
+        self.assertEqual(records[ANNUAL_FORECAST_MODE][dataset][target][model], annual_record)
 
     def test_annual_tuning_uses_only_complete_previous_years(self):
         data = monthly_data(1977, 1990)
