@@ -381,6 +381,8 @@ def generate_map_atlas(dataset_info):
             
             for m in FORECAST_VALUE_COLUMNS:
                 vals = df_slice[m].to_numpy()
+                if not np.isfinite(vals).any():
+                    continue
                 da = interpolate_map(points, vals, grid_lat, grid_lon)
                 if var == 'Precip':
                     da = da.clip(min=0)

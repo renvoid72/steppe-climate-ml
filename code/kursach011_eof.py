@@ -26,7 +26,8 @@ from sklearn.preprocessing import StandardScaler
 from kursach011_modules.forecast_engine import read_validation_csv
 from kursach011_modules.meteo_data import load_monthly_meteo
 from kursach011_modules.project_settings import (
-    ANALYSIS_YEAR, CRU_VERSION, VALIDATION_PERIOD, cru_csv_path, results_dir, validation_filename,
+    ANALYSIS_YEAR, CRU_VERSION, VALIDATION_END_YEAR, VALIDATION_PERIOD, VALIDATION_START_YEAR,
+    cru_csv_path, results_dir, validation_filename,
 )
 
 warnings.filterwarnings('ignore')
@@ -102,143 +103,114 @@ def load_cru_ceda_monthly():
     return df
 
 
+EOF_REGIONS = (
+    ('Вся зона степей', None, None),
+    ('Европейская часть', None, 60),
+    ('Западная Сибирь', 60, 90),
+    ('Восточная Сибирь', 90, 120),
+    ('Дальний Восток', 120, None),
+)
+
+
+class EOFDataUnavailable(ValueError):
+    """Данных среза недостаточно для расчёта ЕОФ."""
+
+
+def regional_rows(rows, lon_min, lon_max):
+    if lon_min is not None:
+        rows = rows.loc[rows['Longitude'] >= lon_min]
+    if lon_max is not None:
+        rows = rows.loc[rows['Longitude'] < lon_max]
+    return rows
+
+
+def eof_calendar_matrix(rows, variable, start_year, end_year):
+    """Формирует календарную матрицу «месяц — станция» по доступным фактам."""
+    calendar = pd.date_range(f'{start_year}-01-01', f'{end_year}-12-01', freq='MS', name='Date')
+    dates = pd.to_datetime(rows['Date']).dt.to_period('M').dt.to_timestamp()
+    rows = rows.assign(Date=dates).loc[dates.isin(calendar), ['Date', 'WMO', variable]]
+    values = rows.replace({variable: {np.inf: np.nan, -np.inf: np.nan}})
+    # В валидации один и тот же факт может встречаться в строках нескольких моделей.
+    return values.groupby(['Date', 'WMO'])[variable].first().unstack('WMO').reindex(calendar)
+
+
+def fit_eof(matrix, n_components=None):
+    """Отбирает станции, вычисляет месячные аномалии и оценивает компоненты."""
+    observed = matrix.dropna(how='all')
+    if observed.empty:
+        raise EOFDataUnavailable('Нет наблюдений для анализа.')
+    missing_months = matrix.index.month.unique().difference(observed.index.month.unique())
+    if len(missing_months):
+        months = ', '.join(map(str, missing_months))
+        raise EOFDataUnavailable(f'Нет наблюдений для календарных месяцев: {months}.')
+
+    # Считаем долю пропусков от календаря среза, включая месяцы без единой записи.
+    available = matrix.loc[:, matrix.notna().mean().ge(0.90)].dropna(how='all')
+    normals = available.groupby(available.index.month).transform('mean')
+    anomalies = available.fillna(normals).sub(normals).dropna(axis=1)
+    # Не включаем в PCA даты, для которых у отобранных станций нет ни одного факта.
+    anomalies = anomalies.loc[available[anomalies.columns].notna().any(axis=1)]
+    n_months, n_stations = anomalies.shape
+    if n_components is not None and min(n_months, n_stations) < n_components:
+        raise EOFDataUnavailable(
+            f'Недостаточно данных для {n_components} компонент (месяцев: {n_months}, станций: {n_stations}).'
+        )
+    if n_months < 2 or not anomalies.var(ddof=0).gt(0).any():
+        raise EOFDataUnavailable('Недостаточно изменчивых наблюдений для оценки дисперсии.')
+
+    pca = PCA(n_components=n_components)
+    scores = pca.fit_transform(StandardScaler().fit_transform(anomalies))
+    pc_names = [f'PC-{index}' for index in range(1, pca.n_components_ + 1)]
+    pcs = pd.DataFrame(scores, index=anomalies.index, columns=pc_names)
+    return pcs, pca, anomalies.columns
+
+
 def calculate_regional_pcs(df_monthly, param, lon_min=None, lon_max=None, start_year=1920, end_year=ANALYSIS_YEAR):
     """Выполняет разложение PCA для конкретного региона, параметра и периода."""
-    # Фильтрация по годам
-    df_sub = df_monthly[(df_monthly['Year'] >= start_year) & (df_monthly['Year'] <= end_year)].copy()
-    
-    # Фильтрация по географической долготе (региону)
-    if lon_min is not None:
-        df_sub = df_sub[df_sub['Longitude'] >= lon_min]
-    if lon_max is not None:
-        df_sub = df_sub[df_sub['Longitude'] < lon_max]
-        
-    if df_sub.empty:
+    rows = regional_rows(df_monthly, lon_min, lon_max)
+    matrix = eof_calendar_matrix(rows, param, start_year, end_year)
+    try:
+        pcs, _, _ = fit_eof(matrix, n_components=3)
+    except EOFDataUnavailable as error:
+        print(f'        {param}. Пропуск: {error}')
         return None
-        
-    # Сводная таблица (строки - даты, столбцы - станции WMO)
-    pivot_df = df_sub.pivot(index='Date', columns='WMO', values=param)
-    pivot_df.index = pd.to_datetime(pivot_df.index)
-    pivot_df = pivot_df.sort_index()
-    
-    # Мягкий фильтр пропусков: не более 10% пропущенных месяцев
-    max_missing = int(0.10 * len(pivot_df))
-    missing_counts = pivot_df.isnull().sum()
-    keep_stations = missing_counts[missing_counts <= max_missing].index
-    pivot_df = pivot_df[keep_stations].copy()
-    
-    if pivot_df.shape[1] < 3:
-        # Недостаточно станций для разложения на 3 моды ЕОФ
-        return None
-        
-    # Заполнение редких пропусков климатологической нормой
-    climatology = pivot_df.groupby(pivot_df.index.month).mean()
-    months_series = pd.Series(pivot_df.index.month, index=pivot_df.index)
-    for col in pivot_df.columns:
-        if pivot_df[col].isnull().any():
-            fill_values = months_series.map(climatology[col])
-            pivot_df[col] = pivot_df[col].fillna(fill_values)
-            
-    # Расчет климатических аномалий (центрирование)
-    climatology_filled = pivot_df.groupby(pivot_df.index.month).mean()
-    anomalies = pivot_df.copy()
-    for month in range(1, 13):
-        anomalies.loc[anomalies.index.month == month] -= climatology_filled.loc[month]
-        
-    # Стандартизация дисперсии
-    scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(anomalies)
-    
-    # Разложение PCA
-    pca = PCA(n_components=3)
-    pcs = pca.fit_transform(scaled_data)
-    
-    res_df = pd.DataFrame(pcs, columns=['PC-1', 'PC-2', 'PC-3'], index=pivot_df.index)
-    return res_df
+    return pcs
 
 
 def export_historical_eof_series():
-    """Реализует второй этап: расчет и экспорт PC серий в Excel файлы."""
+    """Экспортирует исторические ряды компонент по регионам в Excel."""
     print("\n4. Расчет и экспорт исторических временных серий ЕОФ (PC)...")
-    
-    regions_config = [
-        {'name': 'Вся зона степей', 'lon_min': None, 'lon_max': None},
-        {'name': 'Европейская часть', 'lon_min': None, 'lon_max': 60},
-        {'name': 'Западная Сибирь', 'lon_min': 60, 'lon_max': 90},
-        {'name': 'Восточная Сибирь', 'lon_min': 90, 'lon_max': 120},
-        {'name': 'Дальний Восток', 'lon_min': 120, 'lon_max': None}
-    ]
+    datasets = (
+        ('CRU_CEDA', load_cru_ceda_monthly, 1920, VALIDATION_END_YEAR),
+        ('Meteo_RU', load_meteo_ru_monthly, 1960, ANALYSIS_YEAR),
+    )
+    for dataset, load_monthly, start_year, end_year in datasets:
+        print(f'   Обработка {dataset} ({start_year}-{end_year} гг.)...')
+        try:
+            monthly = load_monthly()
+        except (OSError, ValueError) as error:
+            print(f'   ! Ошибка при чтении {dataset}: {error}')
+            continue
 
-    # 1. CRU (с 1920 г.)
-    cru_end_year = 2020
-    print(f"   Обработка CRU TS {CRU_VERSION} (1920-{cru_end_year} гг.)...")
-    try:
-        df_cru = load_cru_ceda_monthly()
-        cru_out_path = EOF_DIR / f"CRU_CEDA_EOF_TimeSeries_1920-{cru_end_year}.xlsx"
-        
-        with pd.ExcelWriter(cru_out_path, engine='openpyxl') as writer:
-            for reg in regions_config:
-                sheet_name = reg['name']
-                print(f"      Регион: {sheet_name}...")
-                
-                dtr_pcs = calculate_regional_pcs(df_cru, 'DTR', reg['lon_min'], reg['lon_max'], 1920, cru_end_year)
-                precip_pcs = calculate_regional_pcs(df_cru, 'Precip', reg['lon_min'], reg['lon_max'], 1920, cru_end_year)
-                
-                if dtr_pcs is not None and precip_pcs is not None:
-                    # Объединяем PC для температуры и осадков на одной вкладке
-                    merged = pd.DataFrame(index=dtr_pcs.index)
-                    merged['PC-1_DTR'] = dtr_pcs['PC-1']
-                    merged['PC-2_DTR'] = dtr_pcs['PC-2']
-                    merged['PC-3_DTR'] = dtr_pcs['PC-3']
-                    merged['PC-1_Precip'] = precip_pcs['PC-1']
-                    merged['PC-2_Precip'] = precip_pcs['PC-2']
-                    merged['PC-3_Precip'] = precip_pcs['PC-3']
-                    
-                    merged = merged.reset_index()
-                    merged['Date'] = merged['Date'].dt.strftime('%Y-%m-%d')
-                    merged.to_excel(writer, sheet_name=sheet_name, index=False)
-                else:
-                    # Пометка, если станций нет
-                    empty_df = pd.DataFrame({"Статус": ["Нет станций для анализа"]})
-                    empty_df.to_excel(writer, sheet_name=sheet_name, index=False)
-        print(f"   -> Файл успешно сохранен: {cru_out_path.name}")
-    except Exception as e:
-        print(f"   ! Ошибка при экспорте CRU CEDA: {e}")
+        path = EOF_DIR / f'{dataset}_EOF_TimeSeries_{start_year}-{end_year}.xlsx'
+        with pd.ExcelWriter(path, engine='openpyxl') as writer:
+            for region, lon_min, lon_max in EOF_REGIONS:
+                print(f'      Регион: {region}...')
+                all_columns = []
+                tables = []
+                for variable in ('DTR', 'Precip'):
+                    pcs = calculate_regional_pcs(monthly, variable, lon_min, lon_max, start_year, end_year)
+                    all_columns.extend(f'PC-{i}_{variable}' for i in range(1, 4))
+                    if pcs is not None:
+                        tables.append(pcs.add_suffix(f'_{variable}'))
 
-    # 2. Метеостанции РФ
-    print(f"   Обработка метеостанций (1960-{ANALYSIS_YEAR} гг.)...")
-    try:
-        df_meteo = load_meteo_ru_monthly()
-        meteo_out_path = EOF_DIR / f"Meteo_RU_EOF_TimeSeries_1960-{ANALYSIS_YEAR}.xlsx"
-        
-        with pd.ExcelWriter(meteo_out_path, engine='openpyxl') as writer:
-            for reg in regions_config:
-                sheet_name = reg['name']
-                print(f"      Регион: {sheet_name}...")
-                
-                dtr_pcs = calculate_regional_pcs(df_meteo, 'DTR', reg['lon_min'], reg['lon_max'], 1960, ANALYSIS_YEAR)
-                precip_pcs = calculate_regional_pcs(df_meteo, 'Precip', reg['lon_min'], reg['lon_max'], 1960, ANALYSIS_YEAR)
-                
-                if dtr_pcs is not None and precip_pcs is not None:
-                    # Объединяем PC для температуры и осадков на одной вкладке
-                    merged = pd.DataFrame(index=dtr_pcs.index)
-                    merged['PC-1_DTR'] = dtr_pcs['PC-1']
-                    merged['PC-2_DTR'] = dtr_pcs['PC-2']
-                    merged['PC-3_DTR'] = dtr_pcs['PC-3']
-                    merged['PC-1_Precip'] = precip_pcs['PC-1']
-                    merged['PC-2_Precip'] = precip_pcs['PC-2']
-                    merged['PC-3_Precip'] = precip_pcs['PC-3']
-                    
-                    merged = merged.reset_index()
+                if tables:
+                    merged = pd.concat(tables, axis=1).sort_index().reindex(columns=all_columns).reset_index()
                     merged['Date'] = merged['Date'].dt.strftime('%Y-%m-%d')
-                    merged.to_excel(writer, sheet_name=sheet_name, index=False)
                 else:
-                    # Пометка, если станций нет
-                    empty_df = pd.DataFrame({"Статус": ["Нет станций для анализа"]})
-                    empty_df.to_excel(writer, sheet_name=sheet_name, index=False)
-        print(f"   -> Файл успешно сохранен: {meteo_out_path.name}")
-    except Exception as e:
-        print(f"   ! Ошибка при экспорте METEO_RU: {e}")
+                    merged = pd.DataFrame({'Статус': ['Недостаточно данных для трёх компонент']})
+                merged.to_excel(writer, sheet_name=region, index=False)
+        print(f'   -> Файл успешно сохранен: {path.name}')
 
 
 def export_all_components_variance():
@@ -268,14 +240,6 @@ def export_all_components_variance():
         }
     ]
     
-    regions_config = [
-        {'name': 'Вся зона степей', 'lon_min': None, 'lon_max': None},
-        {'name': 'Европейская часть', 'lon_min': None, 'lon_max': 60},
-        {'name': 'Западная Сибирь', 'lon_min': 60, 'lon_max': 90},
-        {'name': 'Восточная Сибирь', 'lon_min': 90, 'lon_max': 120},
-        {'name': 'Дальний Восток', 'lon_min': 120, 'lon_max': None}
-    ]
-    
     for item in datasets_config:
         csv_path = RESULTS_DIR / 'validation_results' / 'csv_data' / item['file_name']
         if not csv_path.exists():
@@ -290,79 +254,27 @@ def export_all_components_variance():
         except ValueError as error:
             print(error)
             continue
-        df_unique = df.drop_duplicates(subset=['Date', 'WMO']).copy()
-        
         with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
-            for reg in regions_config:
-                sheet_name = reg['name']
-                
-                # Фильтрация по долготе
-                df_sub = df_unique.copy()
-                if reg['lon_min'] is not None:
-                    df_sub = df_sub[df_sub['Longitude'] >= reg['lon_min']]
-                if reg['lon_max'] is not None:
-                    df_sub = df_sub[df_sub['Longitude'] < reg['lon_max']]
-                    
-                if df_sub.empty:
-                    empty_df = pd.DataFrame({"Статус": ["Нет станций для анализа"]})
-                    empty_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            for region, lon_min, lon_max in EOF_REGIONS:
+                matrix = eof_calendar_matrix(
+                    regional_rows(df, lon_min, lon_max), 'Fact', VALIDATION_START_YEAR, VALIDATION_END_YEAR,
+                )
+                try:
+                    _, pca, _ = fit_eof(matrix)
+                except EOFDataUnavailable as error:
+                    print(f'      {region}. Пропуск: {error}')
+                    pd.DataFrame({'Статус': [str(error)]}).to_excel(writer, sheet_name=region, index=False)
                     continue
-                    
-                # Pivot
-                pivot_df = df_sub.pivot(index='Date', columns='WMO', values='Fact')
-                pivot_df.index = pd.to_datetime(pivot_df.index)
-                pivot_df = pivot_df.sort_index()
-                
-                # Мягкий фильтр пропусков (<= 10% месяцев)
-                max_missing = int(0.10 * len(pivot_df))
-                missing_counts = pivot_df.isnull().sum()
-                keep_stations = missing_counts[missing_counts <= max_missing].index
-                pivot_df = pivot_df[keep_stations].copy()
-                
-                n_stations = pivot_df.shape[1]
-                if n_stations == 0:
-                    empty_df = pd.DataFrame({"Статус": ["Нет станций для анализа"]})
-                    empty_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                    continue
-                    
-                # Заполнение пропусков
-                climatology = pivot_df.groupby(pivot_df.index.month).mean()
-                months_series = pd.Series(pivot_df.index.month, index=pivot_df.index)
-                for col in pivot_df.columns:
-                    if pivot_df[col].isnull().any():
-                        fill_values = months_series.map(climatology[col])
-                        pivot_df[col] = pivot_df[col].fillna(fill_values)
-                        
-                # Центрирование (аномалии)
-                climatology_filled = pivot_df.groupby(pivot_df.index.month).mean()
-                anomalies = pivot_df.copy()
-                for month in range(1, 13):
-                    anomalies.loc[anomalies.index.month == month] -= climatology_filled.loc[month]
-                    
-                # Стандартизация
-                scaler = StandardScaler()
-                scaled_data = scaler.fit_transform(anomalies)
-                
-                # PCA для всех компонент
-                pca = PCA()
-                pca.fit(scaled_data)
-                
+
                 ev = pca.explained_variance_ratio_ * 100
-                cum_ev = np.cumsum(ev)
-                
-                # Таблица результатов
-                res_df = pd.DataFrame({
+                cumulative_ev = np.cumsum(ev)
+                cumulative_ev[-1] = 100
+                pd.DataFrame({
                     'Компонента': [f'ЕОФ-{i+1}' for i in range(len(ev))],
                     'Объясненная дисперсия (%)': np.round(ev, 4),
-                    'Накопленная дисперсия (%)': np.round(cum_ev, 4)
-                })
-                
-                # Корректировка последней строчки до ровно 100%
-                if len(res_df) > 0:
-                    res_df.loc[res_df.index[-1], 'Накопленная дисперсия (%)'] = 100.0000
-                    
-                res_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                
+                    'Накопленная дисперсия (%)': np.round(cumulative_ev, 4),
+                }).to_excel(writer, sheet_name=region, index=False)
+
         print(f"   -> Успешно сохранен: {item['out_name']}")
 
 
@@ -431,45 +343,10 @@ def main():
             print(error)
             continue
         
-        # Убираем дублирование из-за разных моделей, берем только факт
-        df_unique = df.drop_duplicates(subset=['Date', 'WMO']).copy()
-        
-        # Сохраняем координаты станций
-        coords_df = df_unique[['WMO', 'Latitude', 'Longitude']].drop_duplicates(subset=['WMO'])
+        coords_df = df[['WMO', 'Latitude', 'Longitude']].drop_duplicates(subset=['WMO'])
         wmo_to_coords = coords_df.set_index('WMO')[['Latitude', 'Longitude']].to_dict('index')
-        
-        # 2. Формирование матрицы "Время - Пространство"
-        pivot_df = df_unique.pivot(index='Date', columns='WMO', values='Fact')
-        pivot_df.index = pd.to_datetime(pivot_df.index)
-        pivot_df = pivot_df.sort_index()
-        
-        # Фильтрация пропусков (мягкая очистка: оставляем станции с пропуском не более 10% месяцев)
-        initial_stations = pivot_df.shape[1]
-        max_missing_months = 36  # ~10% от 372 месяцев
-        missing_counts = pivot_df.isnull().sum()
-        keep_stations = missing_counts[missing_counts <= max_missing_months].index
-        pivot_df = pivot_df[keep_stations].copy()
-        final_stations = pivot_df.shape[1]
-        print(f"      Станций до очистки: {initial_stations}, после мягкой фильтрации: {final_stations} (удалено с пропусками > 10%: {initial_stations - final_stations})")
-        
-        if final_stations == 0:
-            print("      Ошибка: Не осталось станций после фильтрации. Пропуск.")
-            continue
+        matrix = eof_calendar_matrix(df, 'Fact', VALIDATION_START_YEAR, VALIDATION_END_YEAR)
 
-        # Заполнение редких пропусков климатической нормой для данной станции
-        climatology_temp = pivot_df.groupby(pivot_df.index.month).mean()
-        months_series = pd.Series(pivot_df.index.month, index=pivot_df.index)
-        for col in pivot_df.columns:
-            if pivot_df[col].isnull().any():
-                fill_values = months_series.map(climatology_temp[col])
-                pivot_df[col] = pivot_df[col].fillna(fill_values)
-
-        # 3. Расчет климатических аномалий (центрирование по месяцам)
-        climatology = pivot_df.groupby(pivot_df.index.month).mean()
-        anomalies = pivot_df.copy()
-        for month in range(1, 13):
-            anomalies.loc[anomalies.index.month == month] -= climatology.loc[month]
-            
         # Определение сезонов
         seasons_def = {
             'Winter': {'months': [12, 1, 2], 'name_ru': 'Зима'},
@@ -481,21 +358,15 @@ def main():
         # Расчет PCA отдельно по сезонам
         for s_name, s_info in seasons_def.items():
             print(f"      Разложение для сезона: {s_info['name_ru']}...")
-            anomalies_season = anomalies[anomalies.index.month.isin(s_info['months'])].copy()
-            
-            if anomalies_season.empty:
+            season_matrix = matrix.loc[matrix.index.month.isin(s_info['months'])]
+            try:
+                pcs, pca, stations = fit_eof(season_matrix, n_components=3)
+            except EOFDataUnavailable as error:
+                print(f"        Пропуск ({s_info['name_ru']}): {error}")
                 continue
-                
-            # Стандартизация дисперсии сезонной матрицы
-            scaler = StandardScaler()
-            scaled_data = scaler.fit_transform(anomalies_season)
-            
-            # PCA
-            pca = PCA(n_components=3)
-            pcs = pca.fit_transform(scaled_data)  # Временной ход (PC)
-            loadings = pca.components_            # Пространственные веса (EOFs)
+            loadings = pca.components_
             explained_var = pca.explained_variance_ratio_ * 100
-            
+
             print(f"        Объясненная дисперсия: ЕОФ-1: {explained_var[0]:.2f}%, ЕОФ-2: {explained_var[1]:.2f}%, ЕОФ-3: {explained_var[2]:.2f}%")
             
             # Сохранение дисперсии для отчета
@@ -510,9 +381,9 @@ def main():
             
             # Отрисовка графиков временного хода (Principal Components)
             plt.figure(figsize=(14, 5))
-            plt.plot(anomalies_season.index, pcs[:, 0], label=f'PC-1 ({explained_var[0]:.2f}%)', color='#1f77b4', linewidth=1.5, marker='o', markersize=3)
-            plt.plot(anomalies_season.index, pcs[:, 1], label=f'PC-2 ({explained_var[1]:.2f}%)', color='#2ca02c', linewidth=1.5, marker='s', markersize=3)
-            plt.plot(anomalies_season.index, pcs[:, 2], label=f'PC-3 ({explained_var[2]:.2f}%)', color='#d62728', linewidth=1.5, marker='^', markersize=3)
+            plt.plot(pcs.index, pcs['PC-1'], label=f'PC-1 ({explained_var[0]:.2f}%)', color='#1f77b4', linewidth=1.5, marker='o', markersize=3)
+            plt.plot(pcs.index, pcs['PC-2'], label=f'PC-2 ({explained_var[1]:.2f}%)', color='#2ca02c', linewidth=1.5, marker='s', markersize=3)
+            plt.plot(pcs.index, pcs['PC-3'], label=f'PC-3 ({explained_var[2]:.2f}%)', color='#d62728', linewidth=1.5, marker='^', markersize=3)
             plt.axhline(0, color='black', linestyle='--', linewidth=0.8, alpha=0.7)
             
             plt.title(f"Временной ход глав. компонент (PCs) | Сезон: {s_info['name_ru']}\n{item['title_ds']} | {item['title_param']} ({VALIDATION_PERIOD} гг.)", fontsize=12, fontweight='bold')
@@ -532,8 +403,8 @@ def main():
             png_dir = EOF_DIR / "maps_png" / s_name / item['dir_name'] / item['param']
             tiff_dir = EOF_DIR / "maps_tiff" / s_name / item['dir_name'] / item['param']
             
-            lats = np.array([wmo_to_coords[wmo]['Latitude'] for wmo in anomalies_season.columns])
-            lons = np.array([wmo_to_coords[wmo]['Longitude'] for wmo in anomalies_season.columns])
+            lats = np.array([wmo_to_coords[wmo]['Latitude'] for wmo in stations])
+            lons = np.array([wmo_to_coords[wmo]['Longitude'] for wmo in stations])
             
             located = np.isfinite(lats) & np.isfinite(lons)
             if not located.any():
