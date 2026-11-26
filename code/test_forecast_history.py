@@ -441,3 +441,104 @@ class ForecastGraphTest(unittest.TestCase):
             RU_TITLES[knn]: [45., np.nan, 18., np.nan],
         }, index=pd.date_range('2019-01-01', periods=4, freq='MS'))
         pd.testing.assert_frame_equal(plotted, expected, check_freq=False)
+
+
+class ForecastMapTest(unittest.TestCase):
+    def test_station_metrics_keep_existing_tolerances_and_score_colocated_stations_separately(self):
+        from kursach011_modules.visualizer import BaseVisualizer
+
+        records = pd.DataFrame({
+            'WMO': list('ABCDE'), 'Latitude': 50, 'Longitude': 40, 'Date': '2024-01-01',
+            'Fact': [0., 50., 50., 0., np.nan], 'Forecast': [3., 60., 60.01, 5.01, 0.],
+        })
+        visualizer = BaseVisualizer.__new__(BaseVisualizer)
+        for target, accuracy in [('Precip', [100., 100., 0., 0., np.nan]), ('DTR', [100., 0., 0., 0., np.nan])]:
+            with self.subTest(target=target):
+                metrics = visualizer._calculate_metrics(records, target).set_index('WMO')
+                self.assertEqual(metrics['N_Pairs'].tolist(), [1, 1, 1, 1, 0])
+                np.testing.assert_allclose(metrics['Accuracy'], accuracy)
+                self.assertTrue(metrics['Correlation'].isna().all())
+
+    def test_maps_use_available_pairs_and_show_counts_in_both_modes(self):
+        import xarray as xr
+        from matplotlib.figure import Figure
+        from matplotlib.text import Annotation
+        from PIL import Image
+
+        from kursach011_modules.visualizer import StandardForecastVisualizer, ValidationVisualizer
+
+        records = pd.DataFrame([
+            (6, 'A', 50, 40, 0., 0.),
+            (7, 'A', 50, 40, np.nan, 1.),
+            (8, 'A', 50, 40, 5., np.nan),
+            (6, 'B', 52, 40, 0., 1.),
+            (7, 'B', 52, 40, 0., 2.),
+            (8, 'B', 52, 40, 5., np.inf),
+            (6, 'C', 51, 41, np.nan, 1.),
+            (6, 'D', 50, 43, 0., 1.),
+            (7, 'D', 50, 43, 5., 6.),
+            (6, 'E', 52, 43, 5., 5.),
+            (7, 'E', 52, 43, 6., 6.),
+            (8, 'E', 52, 43, 7., 5.),
+        ], columns=['Month', 'WMO', 'Latitude', 'Longitude', 'Fact', 'Forecast'])
+        records = records.assign(Model='K-Neighbors', Forecast_Mode=ANNUAL_FORECAST_MODE)
+        cases = (
+            (StandardForecastVisualizer, forecast_filename('METEO_RU', 'Precip'), 2024,
+             'METEO_RU_Precip_K-Neighbors_2024_Summer'),
+            (ValidationVisualizer, validation_filename('METEO_RU', 'Precip'), 2020,
+             'ValidMap_METEO_RU_Precip_K-Neighbors'),
+        )
+        expected_counts = {(40, 50): '1', (40, 52): '2', (41, 51): '0', (43, 50): '2', (43, 52): '3'}
+        original_savefig = Figure.savefig
+
+        for visualizer_class, filename, year, prefix in cases:
+            with self.subTest(mode=visualizer_class.__name__), TemporaryDirectory() as output:
+                visualizer = visualizer_class(output, output)
+                visualizer.csv_dir.mkdir()
+                dates = pd.to_datetime(records[['Month']].assign(Year=year, Day=1))
+                records.assign(Date=dates).to_csv(visualizer.csv_dir / filename, index=False)
+                rendered = {}
+
+                def capture_map(figure, path, **kwargs):
+                    if Path(path).parent == visualizer.out_maps_png:
+                        ax = figure.axes[0]
+                        rendered[Path(path).stem] = (
+                            {text.xy: text.get_text() for text in ax.texts if isinstance(text, Annotation)},
+                            {
+                                tuple(point) for collection in ax.collections if collection.get_label() == 'Нет оценки'
+                                for point in collection.get_offsets()
+                            },
+                            ' '.join([ax.get_title(), *(text.get_text() for text in ax.texts)]),
+                        )
+                    return original_savefig(figure, path, **kwargs)
+
+                with (
+                    patch.object(Figure, 'savefig', capture_map),
+                    patch.object(visualizer, '_save_map_netcdf_and_png', wraps=visualizer._save_map_netcdf_and_png)
+                    as save_map,
+                ):
+                    visualizer.run()
+
+                metrics = save_map.call_args_list[0].args[0].set_index('WMO').sort_index()
+                self.assertEqual(metrics['N_Pairs'].tolist(), [1, 2, 0, 2, 3])
+                np.testing.assert_allclose(metrics['Accuracy'], [100., 100., np.nan, 100., 100.])
+                np.testing.assert_allclose(metrics['Correlation'], [np.nan, np.nan, np.nan, 1., 0.], atol=1e-12)
+
+                for metric in ('Correlation', 'Accuracy'):
+                    stem = f'{prefix}_{metric}'
+                    with Image.open(visualizer.out_maps_png / f'{stem}.png') as png:
+                        self.assertEqual(png.format, 'PNG')
+                    with Image.open(visualizer.out_maps_tiff / f'{stem}.tif') as tiff:
+                        self.assertEqual(tiff.format, 'TIFF')
+                    counts, unscored, text = rendered[stem]
+                    self.assertEqual(counts, expected_counts)
+                    self.assertEqual(unscored, {(41, 51)} if metric == 'Accuracy' else {(40, 50), (40, 52), (41, 51)})
+                    self.assertEqual('До трёх пар' in text, metric == 'Correlation' and year == 2024)
+                    with xr.open_dataset(visualizer.out_maps_nc / f'{stem}.nc', decode_coords='all') as dataset:
+                        grid = dataset[metric].values
+                        finite = grid[np.isfinite(grid)]
+                        if metric == 'Correlation':
+                            self.assertEqual(finite.size, 0)
+                        else:
+                            self.assertGreater(finite.size, 0)
+                            np.testing.assert_allclose(finite, 100.)
