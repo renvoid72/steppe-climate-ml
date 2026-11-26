@@ -17,8 +17,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from kursach011_modules.project_settings import VALIDATION_PERIOD, results_dir, validation_filename
-from kursach011_modules.forecast_engine import read_validation_csv
+from kursach011_modules.forecast_engine import forecast_input_files, read_validation_csv
+from kursach011_modules.meteo_data import load_monthly_meteo
+from kursach011_modules.project_settings import (
+    VALIDATION_END_YEAR, VALIDATION_PERIOD, VALIDATION_START_YEAR, results_dir, validation_filename,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -80,6 +83,45 @@ RU_SEASONS_NAME = {
 }
 
 
+def validation_months(rows):
+    """Оставляет строки расчётного периода и приводит даты к началу месяца."""
+    dates = pd.to_datetime(rows['Date']).dt.to_period('M').dt.to_timestamp()
+    return rows.assign(Date=dates).loc[dates.dt.year.between(VALIDATION_START_YEAR, VALIDATION_END_YEAR)]
+
+
+def finite_pairs(rows, reference):
+    return rows.loc[np.isfinite(rows[['Fact_meteo', reference]]).all(axis=1)]
+
+
+def summarize_correlations(rows, reference):
+    station_rows = []
+    for _, group in rows.groupby('WMO'):
+        if len(group) < 12:
+            continue
+        r = group['Fact_meteo'].corr(group[reference])
+        if np.isfinite(r):
+            station_rows.append((group['Latitude_meteo'].iloc[0], group['Longitude_meteo'].iloc[0], r))
+    stations = pd.DataFrame(station_rows, columns=['Latitude', 'Longitude', 'R'], dtype=float)
+    overall_r = rows['Fact_meteo'].corr(rows[reference]) if len(rows) >= 2 else np.nan
+    return stations, {
+        'n_pairs': len(rows),
+        'mean_station_r': stations['R'].mean(),
+        'overall_r': overall_r,
+    }
+
+
+def write_season_summary(file, season, data, indent):
+    file.write(f"{indent}Сезон: {RU_SEASONS_NAME[season]} ({season})\n")
+    file.write(f"{indent}  * Число пар: {data['n_pairs']}\n")
+    for key, label in (
+        ('mean_station_r', 'Средний коэффициент корреляции по станциям'),
+        ('overall_r', 'Общий коэффициент корреляции (по всем точкам)'),
+    ):
+        value = data[key]
+        text = f'{value:8.4f}' if np.isfinite(value) else 'нет оценки'
+        file.write(f"{indent}  * {label}: {text}\n")
+
+
 class CrossCorrelationAnalyzer(BaseVisualizer):
     def __init__(self, base_dir, results_dir):
         """Инициализация путей, гео-маски и подложки через BaseVisualizer."""
@@ -90,57 +132,45 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
         print(f"   -> Рабочая папка анализа: {self.work_dir}")
 
     def load_and_merge_data(self):
-        """Загружает CSV долгосрочной валидации и объединяет их по ['Date', 'WMO', 'Model', 'Target_Var']."""
-        print(f"\n2. Загрузка и объединение данных валидации за {VALIDATION_PERIOD} гг...")
-        
-        csv_configs = {
-            'DTR': {
-                'meteo': self.results_dir / 'validation_results' / 'csv_data' / validation_filename('METEO_RU', 'DTR'),
-                'cru': self.results_dir / 'validation_results' / 'csv_data' / validation_filename('CRU_CEDA', 'DTR')
-            },
-            'Precip': {
-                'meteo': self.results_dir / 'validation_results' / 'csv_data' / validation_filename('METEO_RU', 'Precip'),
-                'cru': self.results_dir / 'validation_results' / 'csv_data' / validation_filename('CRU_CEDA', 'Precip')
-            }
-        }
-        
-        merged_datasets = {}
-        
-        for param, paths in csv_configs.items():
-            if not paths['meteo'].exists() or not paths['cru'].exists():
-                raise FileNotFoundError(
-                    f"Не найдены исходные файлы валидации для параметра {param}. "
-                    "Убедитесь, что вы предварительно запустили расчет в kursach011.py!"
-                )
-            
-            print(f"   Обработка параметра {param}...")
-            df_meteo = read_validation_csv(paths['meteo'], 'METEO_RU')
-            df_cru = read_validation_csv(paths['cru'], 'CRU_CEDA')
-            
-            # Обеспечиваем типы данных для корректного слияния
-            df_meteo['WMO'] = df_meteo['WMO'].astype(int)
-            df_cru['WMO'] = df_cru['WMO'].astype(int)
-            df_meteo['Date'] = pd.to_datetime(df_meteo['Date'])
-            df_cru['Date'] = pd.to_datetime(df_cru['Date'])
-            
-            # Внутреннее слияние по Date, WMO, Model и Target_Var
-            merged_df = pd.merge(
-                df_meteo,
-                df_cru,
-                on=['Date', 'WMO', 'Model', 'Target_Var'],
-                suffixes=('_meteo', '_cru')
-            )
-            
-            # Чистим пропуски
-            merged_df = merged_df.dropna(subset=['Fact_meteo', 'Fact_cru', 'Forecast_cru'])
-            
-            print(f"      Наземные наблюдения (Meteo): {len(df_meteo)} строк")
-            print(f"      Глобальный архив (CRU):     {len(df_cru)} строк")
-            print(f"      Объединенных записей:        {len(merged_df)} строк")
-            
-            merged_datasets[param] = merged_df
-            
-        return merged_datasets
+        """Сопоставляет METEO_RU с наблюдениями и прогнозами CRU по станции и месяцу."""
+        print(f"\n2. Сопоставление месячных рядов за {VALIDATION_PERIOD} гг...")
+        meteo = load_monthly_meteo(*forecast_input_files(self.base_dir, 'METEO_RU'))
+        meteo = validation_months(meteo.assign(Date=pd.to_datetime(meteo[['Year', 'Month']].assign(day=1))))
+        cru_path, = forecast_input_files(self.base_dir, 'CRU_CEDA')
+        if cru_path.is_file():
+            cru = pd.read_csv(cru_path)
+            cru = validation_months(cru.assign(Date=pd.to_datetime(cru[['Year', 'Month']].assign(day=1))))
+        else:
+            print(f"   Фактические ряды CRU недоступны: {cru_path}. Запустите code/prepare_cru.py.")
+            cru = meteo.iloc[:0]
+
+        keys = ['Date', 'WMO']
+        meteo_columns = [*keys, 'Latitude', 'Longitude']
+        validation_dir = self.results_dir / 'validation_results' / 'csv_data'
+        observation_pairs = {}
+        forecast_pairs = {}
+        for param in RU_VARS:
+            meteo_values = meteo[[*meteo_columns, param]].rename(columns={
+                param: 'Fact_meteo', 'Latitude': 'Latitude_meteo', 'Longitude': 'Longitude_meteo',
+            })
+            cru_values = cru[[*keys, param]].rename(columns={param: 'Fact_cru'})
+            paired_facts = meteo_values.merge(cru_values, on=keys, validate='one_to_one')
+            observation_pairs[param] = finite_pairs(paired_facts, 'Fact_cru')
+
+            path = validation_dir / validation_filename('CRU_CEDA', param)
+            try:
+                predictions = read_validation_csv(path, 'CRU_CEDA')
+            except (OSError, ValueError) as error:
+                print(f"   Прогнозы CRU для {param} пропущены: {error}")
+                forecast_pairs[param] = meteo_values.iloc[:0].assign(Model='', Forecast_cru=np.nan)
+                continue
+
+            predictions = validation_months(predictions.loc[predictions['Target_Var'] == param])
+            predictions = predictions[[*keys, 'Model', 'Forecast']].rename(columns={'Forecast': 'Forecast_cru'})
+            paired_forecasts = meteo_values.merge(predictions, on=keys, validate='one_to_many')
+            forecast_pairs[param] = finite_pairs(paired_forecasts, 'Forecast_cru')
+
+        return observation_pairs, forecast_pairs
 
     def plot_correlation_map(self, lats, lons, values, title, filename_base, season_name):
         """Интерполирует значения корреляции станций на регулярную сетку и строит карту в сезонной папке."""
@@ -237,211 +267,68 @@ class CrossCorrelationAnalyzer(BaseVisualizer):
         plt.savefig(plot_path, dpi=200)
         plt.close()
 
-    def run_analysis(self, merged_datasets):
-        """Основной цикл сезонных расчетов пространственной и кросс-корреляции."""
-        summary_data = {
-            'block1': {},
-            'block2': {}
-        }
-        
-        # ====================================================================
-        # БЛОК 1: Сравнение датасетов (Meteo_Fact vs CRU_Fact) по сезонам
-        # ====================================================================
-        print("\n3. Расчет Блока 1 (Meteo_Fact vs CRU_Fact) по сезонам...")
-        for param, df in merged_datasets.items():
-            summary_data['block1'][param] = {}
-            print(f"   Параметр: {param}...")
-            
-            # Убираем дублирование месяцев из-за наличия строк по разным моделям
-            df_unique = df.drop_duplicates(subset=['Date', 'WMO']).copy()
-            df_unique['Month'] = df_unique['Date'].dt.month
-            
-            for season_key, months in SEASONS.items():
-                print(f"      Сезон: {RU_SEASONS_NAME[season_key]}...")
-                df_season = df_unique[df_unique['Month'].isin(months)].copy()
-                
-                if df_season.empty:
-                    print(f"         ВНИМАНИЕ: Нет данных для сезона {season_key}!")
-                    continue
-                
-                # Расчет корреляции по станциям
-                station_corrs = []
-                station_lats = []
-                station_lons = []
-                
-                for wmo, group in df_season.groupby('WMO'):
-                    if len(group) >= 12:  # Требуем репрезентативный объем данных для сезона
-                        r = group['Fact_meteo'].corr(group['Fact_cru'])
-                        if not np.isnan(r):
-                            station_corrs.append(r)
-                            station_lats.append(group['Latitude_meteo'].iloc[0])
-                            station_lons.append(group['Longitude_meteo'].iloc[0])
-                
-                station_corrs = np.array(station_corrs)
-                station_lats = np.array(station_lats)
-                station_lons = np.array(station_lons)
-                
-                if len(station_corrs) == 0:
-                    print(f"         ВНИМАНИЕ: Недостаточно станций для расчета корреляции в сезоне {season_key}!")
-                    continue
-                
-                mean_station_r = np.mean(station_corrs)
-                overall_r = df_season['Fact_meteo'].corr(df_season['Fact_cru'])
-                
-                summary_data['block1'][param][season_key] = {
-                    'mean_station_r': mean_station_r,
-                    'overall_r': overall_r
-                }
-                
-                print(f"         Средняя корреляция по {len(station_corrs)} станциям: {mean_station_r:.4f}")
-                print(f"         Общая корреляция (по всем точкам):           {overall_r:.4f}")
-                
-                # 1. Построение карты
-                title_map = (
-                    f"Пространственная корреляция фактических данных:\n"
-                    f"Наблюдения Росгидрометра vs Архив CRU CEDA\n"
-                    f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | {VALIDATION_PERIOD} гг."
-                )
-                file_map = f"Base_Correlation_Meteo_vs_CRU_{param}_{season_key}"
-                self.plot_correlation_map(station_lats, station_lons, station_corrs, title_map, file_map, season_key)
-                
-                # 2. Построение Scatter Plot
-                xlabel = f"Фактические значения Росгидромета, {RU_VARS_UNITS[param]}"
-                ylabel = f"Фактические значения архива CRU CEDA, {RU_VARS_UNITS[param]}"
-                title_scatter = (
-                    f"Сопоставление фактических данных:\n"
-                    f"Наблюдения Росгидрометра vs Архив CRU CEDA\n"
-                    f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | {VALIDATION_PERIOD} гг."
-                )
-                file_scatter = f"Scatter_Meteo_vs_CRU_{param}_{season_key}"
-                self.plot_scatter(df_season['Fact_meteo'].values, df_season['Fact_cru'].values, overall_r, 
-                                  xlabel, ylabel, title_scatter, file_scatter, season_key)
-            
-        # ====================================================================
-        # БЛОК 2: Кросс-корреляция (Meteo_Fact vs CRU_Forecast) по сезонам
-        # ====================================================================
-        print("\n4. Расчет Блока 2 (Meteo_Fact vs CRU_Forecast) по сезонам...")
-        for param, df in merged_datasets.items():
-            summary_data['block2'][param] = {}
-            print(f"   Параметр: {param}...")
-            
-            df['Month'] = df['Date'].dt.month
-            
-            for model_name in RU_MODELS.keys():
-                summary_data['block2'][param][model_name] = {}
-                df_model = df[df['Model'] == model_name].copy()
-                
-                if df_model.empty:
-                    print(f"      ВНИМАНИЕ: Данные для модели {model_name} отсутствуют!")
-                    continue
-                
-                print(f"      Модель: {RU_MODELS[model_name]}...")
-                
-                for season_key, months in SEASONS.items():
-                    print(f"         Сезон: {RU_SEASONS_NAME[season_key]}...")
-                    df_season = df_model[df_model['Month'].isin(months)].copy()
-                    
-                    if df_season.empty:
-                        print(f"            ВНИМАНИЕ: Нет данных для сезона {season_key}!")
-                        continue
-                    
-                    # Расчет корреляции по станциям
-                    station_corrs = []
-                    station_lats = []
-                    station_lons = []
-                    
-                    for wmo, group in df_season.groupby('WMO'):
-                        if len(group) >= 12:
-                            r = group['Fact_meteo'].corr(group['Forecast_cru'])
-                            if not np.isnan(r):
-                                station_corrs.append(r)
-                                station_lats.append(group['Latitude_meteo'].iloc[0])
-                                station_lons.append(group['Longitude_meteo'].iloc[0])
-                    
-                    station_corrs = np.array(station_corrs)
-                    station_lats = np.array(station_lats)
-                    station_lons = np.array(station_lons)
-                    
-                    if len(station_corrs) == 0:
-                        print(f"            ВНИМАНИЕ: Недостаточно станций для расчета в сезоне {season_key}!")
-                        continue
-                    
-                    mean_station_r = np.mean(station_corrs)
-                    overall_r = df_season['Fact_meteo'].corr(df_season['Forecast_cru'])
-                    
-                    summary_data['block2'][param][model_name][season_key] = {
-                        'mean_station_r': mean_station_r,
-                        'overall_r': overall_r
-                    }
-                    
-                    print(f"            Средняя корреляция по {len(station_corrs)} станциям: {mean_station_r:.4f}")
-                    print(f"            Общая корреляция (по всем точкам):           {overall_r:.4f}")
-                    
-                    # Имя файла без пробелов
-                    clean_model_name = model_name.replace(" ", "_")
-                    
-                    # 1. Построение карты
-                    title_map = (
-                        f"Кросс-корреляция: Наблюдения Росгидрометра vs Прогноз CRU ({RU_MODELS[model_name]})\n"
-                        f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | Период: {VALIDATION_PERIOD} гг."
-                    )
-                    file_map = f"Cross_Correlation_Meteo_vs_CRU_{param}_{clean_model_name}_{season_key}"
-                    self.plot_correlation_map(station_lats, station_lons, station_corrs, title_map, file_map, season_key)
-                    
-                    # 2. Построение Scatter Plot
-                    xlabel = f"Фактические значения Росгидромета, {RU_VARS_UNITS[param]}"
-                    ylabel = f"Прогноз модели на основе CRU ({RU_MODELS[model_name]}), {RU_VARS_UNITS[param]}"
-                    title_scatter = (
-                        f"Кросс-сопоставление:\n"
-                        f"Наблюдения Росгидрометра vs Прогноз CRU ({RU_MODELS[model_name]})\n"
-                        f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season_key]} | {VALIDATION_PERIOD} гг."
-                    )
-                    file_scatter = f"Scatter_Cross_Meteo_vs_CRU_{param}_{clean_model_name}_{season_key}"
-                    self.plot_scatter(df_season['Fact_meteo'].values, df_season['Forecast_cru'].values, overall_r,
-                                      xlabel, ylabel, title_scatter, file_scatter, season_key)
-                
-        # ====================================================================
-        # БЛОК 3: Сохранение сводного отчета
-        # ====================================================================
-        print("\n5. Сохранение сводного текстового отчета...")
+    def run_analysis(self, observation_pairs, forecast_pairs):
+        """Рассчитывает сезонные корреляции и сохраняет карты, графики и сводку."""
         summary_path = self.work_dir / "correlation_summary.txt"
-        
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            f.write("========================================================================\n")
-            f.write(f"СВОДНЫЙ ОТЧЕТ ПО СЕЗОННОМУ КРОСС-КОРРЕЛЯЦИОННОМУ АНАЛИЗУ ({VALIDATION_PERIOD} гг.)\n")
-            f.write("Сравнение: Наблюдения Росгидрометра (Meteo) vs База данных CRU CEDA\n")
-            f.write("========================================================================\n\n")
-            
-            f.write("БЛОК 1: СРАВНЕНИЕ ДАТАСЕТОВ (Meteo_Fact vs CRU_Fact)\n")
-            f.write("------------------------------------------------------------------------\n")
-            for param in ['DTR', 'Precip']:
-                f.write(f"Параметр: {RU_VARS[param]} ({param})\n")
-                for season_key in SEASONS.keys():
-                    data = summary_data['block1'][param].get(season_key)
-                    if data:
-                        f.write(f"  Сезон: {RU_SEASONS_NAME[season_key]} ({season_key})\n")
-                        f.write(f"    * Средний коэффициент корреляции по станциям: {data['mean_station_r']:8.4f}\n")
-                        f.write(f"    * Общий коэффициент корреляции по всем точкам: {data['overall_r']:8.4f}\n")
-                f.write("\n")
-                
-            f.write("\nБЛОК 2: КРОСС-КОРРЕЛЯЦИЯ (Meteo_Fact vs CRU_Forecast)\n")
-            f.write("------------------------------------------------------------------------\n")
-            for param in ['DTR', 'Precip']:
-                f.write(f"Параметр: {RU_VARS[param]} ({param})\n")
-                for model_name in RU_MODELS.keys():
-                    f.write(f"  Модель: {RU_MODELS[model_name]} ({model_name})\n")
-                    for season_key in SEASONS.keys():
-                        data = summary_data['block2'][param].get(model_name, {}).get(season_key)
-                        if data:
-                            f.write(f"    Сезон: {RU_SEASONS_NAME[season_key]} ({season_key})\n")
-                            f.write(f"      * Средний коэффициент корреляции по станциям: {data['mean_station_r']:8.4f}\n")
-                            f.write(f"      * Общий коэффициент корреляции по всем точкам: {data['overall_r']:8.4f}\n")
-                    f.write("\n")
-                f.write("\n")
-                
-            f.write("========================================================================\n")
-            
+        with summary_path.open('w', encoding='utf-8') as report:
+            report.write(f"СВОДНЫЙ ОТЧЕТ ПО СЕЗОННОМУ КРОСС-КОРРЕЛЯЦИОННОМУ АНАЛИЗУ ({VALIDATION_PERIOD} гг.)\n\n")
+
+            report.write("БЛОК 1: СРАВНЕНИЕ ДАТАСЕТОВ (Meteo_Fact vs CRU_Fact)\n")
+            for param, rows in observation_pairs.items():
+                print(f"   Сравнение наблюдений METEO_RU и CRU для {param}...")
+                report.write(f"Параметр: {RU_VARS[param]} ({param})\n")
+                for season, months in SEASONS.items():
+                    seasonal = rows.loc[rows['Date'].dt.month.isin(months)]
+                    summary = self.analyze_season(seasonal, param, season)
+                    write_season_summary(report, season, summary, '  ')
+                report.write("\n")
+
+            report.write("БЛОК 2: КРОСС-КОРРЕЛЯЦИЯ (Meteo_Fact vs CRU_Forecast)\n")
+            for param, rows in forecast_pairs.items():
+                print(f"   Сравнение наблюдений METEO_RU с прогнозами CRU для {param}...")
+                report.write(f"Параметр: {RU_VARS[param]} ({param})\n")
+                for model, model_label in RU_MODELS.items():
+                    report.write(f"  Модель: {model_label} ({model})\n")
+                    model_rows = rows.loc[rows['Model'] == model]
+                    for season, months in SEASONS.items():
+                        seasonal = model_rows.loc[model_rows['Date'].dt.month.isin(months)]
+                        summary = self.analyze_season(seasonal, param, season, model=model)
+                        write_season_summary(report, season, summary, '    ')
+                    report.write("\n")
+
         print(f"   -> Сводный отчет сохранен в: {summary_path}")
+
+    def analyze_season(self, rows, param, season, *, model=None):
+        reference = 'Fact_cru' if model is None else 'Forecast_cru'
+        stations, summary = summarize_correlations(rows, reference)
+        overall_r = summary['overall_r']
+        if stations.empty and not np.isfinite(overall_r):
+            return summary
+
+        period = f"Параметр: {RU_VARS[param]} | Сезон: {RU_SEASONS_NAME[season]} | {VALIDATION_PERIOD} гг."
+        if model is None:
+            comparison = "Наблюдения METEO_RU и фактические значения CRU"
+            ylabel = f"Фактические значения CRU, {RU_VARS_UNITS[param]}"
+            map_name = f"Base_Correlation_Meteo_vs_CRU_{param}_{season}"
+            scatter_name = f"Scatter_Meteo_vs_CRU_{param}_{season}"
+        else:
+            comparison = f"Наблюдения METEO_RU и прогноз CRU ({RU_MODELS[model]})"
+            ylabel = f"Прогноз модели на CRU ({RU_MODELS[model]}), {RU_VARS_UNITS[param]}"
+            clean_model = model.replace(" ", "_")
+            map_name = f"Cross_Correlation_Meteo_vs_CRU_{param}_{clean_model}_{season}"
+            scatter_name = f"Scatter_Cross_Meteo_vs_CRU_{param}_{clean_model}_{season}"
+
+        if not stations.empty:
+            self.plot_correlation_map(
+                *stations.to_numpy().T, f"Корреляция по станциям\n{comparison}\n{period}", map_name, season,
+            )
+        if np.isfinite(overall_r):
+            self.plot_scatter(
+                rows['Fact_meteo'].to_numpy(), rows[reference].to_numpy(), overall_r,
+                f"Фактические значения METEO_RU, {RU_VARS_UNITS[param]}", ylabel,
+                f"{comparison}\n{period}", scatter_name, season,
+            )
+        return summary
 
     def cleanup_directories(self):
         """Удаляет пустые служебные папки (например, csv_data и maps), если они не заполнялись."""
@@ -465,10 +352,10 @@ def main():
         analyzer = CrossCorrelationAnalyzer(PROJECT_DIR, RESULTS_DIR)
         
         # Шаг 1. Загрузка и объединение данных
-        merged_datasets = analyzer.load_and_merge_data()
+        observation_pairs, forecast_pairs = analyzer.load_and_merge_data()
         
         # Шаг 2. Расчет корреляций и построение графиков/карт
-        analyzer.run_analysis(merged_datasets)
+        analyzer.run_analysis(observation_pairs, forecast_pairs)
         
         # Шаг 3. Очистка неиспользуемых папок
         analyzer.cleanup_directories()
