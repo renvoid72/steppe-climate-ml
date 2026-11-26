@@ -430,18 +430,21 @@ class ValidationVisualizer(BaseVisualizer):
     def __init__(self, base_dir, results_dir):
         super().__init__(base_dir, results_dir, "validation_results")
 
-    def run(self, start_year=VALIDATION_START_YEAR, end_year=VALIDATION_END_YEAR):
+    def run(self, start_year=VALIDATION_START_YEAR, end_year=VALIDATION_END_YEAR, *, end_year_by_dataset=None):
         print("\n--- [Viz] Прямой прогноз на 12 месяцев (Карты за весь период оценки) ---")
-        years_range = f'{start_year}-{end_year}'
         for dataset, var in product(DATASETS, TARGETS):
-            f = self.csv_dir / validation_filename(dataset, var, start_year, end_year)
+            final_year = end_year if end_year_by_dataset is None else end_year_by_dataset.get(dataset)
+            if final_year is None:
+                continue
+            years_range = f'{start_year}-{final_year}'
+            f = self.csv_dir / validation_filename(dataset, var, start_year, final_year)
             if not f.is_file():
                 continue
             print(f"  Обработка: {f.name}...")
             try:
                 df = read_validation_csv(f, dataset)
                 df['Date'] = pd.to_datetime(df['Date'])
-                df = df.loc[df['Date'].dt.year.between(start_year, end_year)]
+                df = df.loc[df['Date'].dt.year.between(start_year, final_year)]
                 if df.empty:
                     continue
                 

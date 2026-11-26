@@ -21,6 +21,7 @@ from kursach011_modules.mlp_diagnostics import MlpDiagnostics
 from kursach011_modules.model_parameters import (
     BEST_PARAMS, MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE, read_model_parameters, save_model_parameters,
 )
+from kursach011_modules.project_settings import cru_csv_path
 from kursach011_modules.tuning_lab import TUNING_YEARS, parameter_candidates, prepare_tuning_splits, select_parameters
 
 
@@ -123,6 +124,9 @@ class MlpDiagnosticsTest(TestCase):
         self.output = self.base_dir / 'output011_modules'
         self.diagnostics = self.base_dir / 'diagnostics' / 'mlp'
         self.source = monthly_data(1985, 1989)
+        cru = cru_csv_path(self.base_dir)
+        cru.parent.mkdir(parents=True)
+        self.source.to_csv(cru, index=False)
         self.dataset = 'CRU_CEDA'
         self.params = {'hidden_layer_sizes': (2,), 'max_iter': 1}
         self.enterContext(redirect_stdout(StringIO()))
@@ -291,19 +295,24 @@ class ModelParametersTest(TestCase):
         standard = StandardForecaster(self.output, self.output)
         annual = LongTermValidator(self.output, self.output)
         filename = 'predictions.csv'
+        hashes = {'Input_Data_Hash': 'data', 'Forecast_Code_Hash': 'code'}
         rows = monthly_data(2024, 2024).iloc[:1].assign(
             Forecast=1., Fact=1., Model=self.model, Target_Var=self.target,
         )
         for engine in (standard, annual):
-            engine._save_predictions([rows], filename, self.dataset)
-            self.assertIsNotNone(engine._load_cached_predictions(filename, self.dataset))
+            engine._save_predictions([rows], filename, self.dataset, hashes)
+            self.assertFalse(engine._load_cached_predictions(filename, self.dataset, self.target, hashes).empty)
         self.save_neighbors(ANNUAL_FORECAST_MODE, 42)
 
         standard = StandardForecaster(self.output, self.output)
         annual = LongTermValidator(self.output, self.output)
-        self.assertIsNotNone(standard._load_cached_predictions(filename, self.dataset))
-        self.assertIsNone(annual._load_cached_predictions(filename, self.dataset))
-        annual._save_predictions([rows], filename, self.dataset)
-        self.assertIsNotNone(annual._load_cached_predictions(filename, self.dataset))
+        self.assertFalse(standard._load_cached_predictions(filename, self.dataset, self.target, hashes).empty)
+        with self.assertRaisesRegex(ValueError, 'изменились параметры моделей'):
+            annual._load_cached_predictions(filename, self.dataset, self.target, hashes)
+        annual._save_predictions([rows], filename, self.dataset, hashes)
+        self.assertFalse(annual._load_cached_predictions(filename, self.dataset, self.target, hashes).empty)
         self.path.unlink()
-        self.assertIsNone(LongTermValidator(self.output, self.output)._load_cached_predictions(filename, self.dataset))
+        with self.assertRaisesRegex(ValueError, 'изменились параметры моделей'):
+            LongTermValidator(self.output, self.output)._load_cached_predictions(
+                filename, self.dataset, self.target, hashes,
+            )
