@@ -32,6 +32,7 @@ TUNING_YEARS = {
     MONTHLY_FORECAST_MODE: (2022, 2023),
     ANNUAL_FORECAST_MODE: tuple(range(1980, 1990)),
 }
+MONTHLY_TUNING_LAST_MONTH = 11
 N_ITER = 10
 PARAM_GRIDS = {
     'Random Forest': {
@@ -77,7 +78,7 @@ def annual_tuning_splits(features, monthly, years, target_var):
         yield features.loc[train], forecast, targets[train], targets[test], np.tile(months.to_numpy(), len(forecast))
 
 
-def prepare_tuning_splits(monthly, mode, years):
+def prepare_tuning_splits(monthly, mode, years, *, last_month=12):
     """Готовит признаки один раз для обоих показателей и всех кандидатов."""
     if mode not in FORECAST_MODES:
         raise ValueError(f'Неизвестный режим подбора: {mode}')
@@ -89,7 +90,10 @@ def prepare_tuning_splits(monthly, mode, years):
         features = select_model_rows(prepare_annual_features(monthly, max(years)))
         return partial(annual_tuning_splits, features, monthly, years)
 
+    last_date = pd.Timestamp(max(years), last_month, 1)
     dates = pd.DatetimeIndex([pd.Timestamp(year, month, 1) for year in years for month in range(1, 13)])
+    dates = dates[dates <= last_date]
+    monthly = monthly.loc[monthly['Date'] <= last_date]
     history, forecasts = prepare_forecast_period(monthly, dates)
     return partial(monthly_tuning_splits, history, select_model_rows(forecasts), monthly, dates)
 
@@ -144,22 +148,37 @@ def tuning_data_source(base_dir, dataset_name):
 
 
 def tune_dataset(monthly, dataset_name, source, mode, years, active_records, *, diagnostics_dir):
-    splits = prepare_tuning_splits(monthly, mode, years)
+    is_monthly = mode == MONTHLY_FORECAST_MODE
+    last_month = MONTHLY_TUNING_LAST_MONTH if is_monthly else 12
+    splits = prepare_tuning_splits(monthly, mode, years, last_month=last_month)
+    metadata = {'years': list(years), 'data_source': source}
+    if is_monthly:
+        start = f'{min(years)}-01'
+        end = f'{max(years)}-{last_month:02d}'
+        metadata.update(start_month=start, end_month=end)
+        period = f'{start}_{end}'
+        print(f'Подбор {mode} за {start} — {end}')
+    else:
+        period = f'{years[0]}-{years[-1]}'
+        print(f'Подбор {mode} за {years[0]}–{years[-1]} гг.')
+
     results = {}
     for target_var, models in BEST_PARAMS[dataset_name].items():
-        for model_name in models:
+        for model_name, baseline in models.items():
             print(f'{dataset_name} | {mode} | {target_var} | {model_name}', flush=True)
-            candidates = parameter_candidates(model_name, active_records[target_var][model_name]['parameters'])
+            # Прежний помесячный подбор мог учитывать зарезервированный декабрь.
+            initial = baseline if is_monthly else active_records[target_var][model_name]['parameters']
+            candidates = parameter_candidates(model_name, initial)
             if model_name == 'MLP Neural Network':
                 diagnostics = MlpDiagnostics()
                 fit = partial(diagnostics.fit, mode=mode, dataset=dataset_name, target=target_var)
                 result = select_parameters(
                     splits(target_var), target_var, model_name, candidates, fit_with_diagnostics=fit,
                 )
-                diagnostics.save(diagnostics_dir / f'{mode}_{dataset_name}_{target_var}_{years[0]}-{years[-1]}.json')
+                diagnostics.save(diagnostics_dir / f'{mode}_{dataset_name}_{target_var}_{period}.json')
             else:
                 result = select_parameters(splits(target_var), target_var, model_name, candidates)
-            result.update(years=list(years), data_source=source)
+            result.update(metadata)
             results[mode, dataset_name, target_var, model_name] = result
             print(f"  MAE={result['score']:.4f}, месяцев={result['n_months']}, пар={result['n_station_months']}")
             print(f"  {result['parameters']}")
@@ -182,7 +201,6 @@ def main():
         source = tuning_data_source(BASE_DIR, dataset_name)
         for mode in modes:
             years = TUNING_YEARS[mode]
-            print(f'Подбор {mode} за {years[0]}–{years[-1]} гг.')
             updates.update(tune_dataset(
                 monthly, dataset_name, source, mode, years, active_records[mode][dataset_name],
                 diagnostics_dir=diagnostics_dir,

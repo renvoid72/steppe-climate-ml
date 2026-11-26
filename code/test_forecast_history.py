@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import unittest
 from contextlib import redirect_stdout
-from io import BytesIO, TextIOWrapper
+from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -237,6 +237,33 @@ class ForecastHistoryTest(unittest.TestCase):
         self.assertEqual(cached_only.count('[SKIP]'), 2)
         self.assertEqual(cached_only.count('Для сравнения с климатологией нужны исходные месячные ряды.'), 2)
 
+    def test_standard_forecast_can_cache_december_separately_from_the_calendar_year(self):
+        forecaster = StandardForecaster(self.output_dir, self.output_dir)
+        self.use_knn(forecaster)
+        for target in ('DTR', 'Precip'):
+            forecaster.model_parameters('K-Neighbors', target, 'METEO_RU')['n_neighbors'] = 3
+        self.run_with_cp1251_stdout(forecaster.run, 2024, 'METEO_RU')
+        annual_csv = forecaster.output_dir / 'METEO_RU_Precip_2024.csv'
+        annual_contents = annual_csv.read_bytes()
+
+        with patch.object(forecaster, '_fit_predict_model', wraps=forecaster._fit_predict_model) as fit:
+            self.run_with_cp1251_stdout(forecaster.run, 2023, 'METEO_RU', target_month=12)
+        self.assertEqual(fit.call_count, 2)
+        for call in fit.call_args_list:
+            train, forecast = call.args[:2]
+            self.assertTrue(train['Date'].lt('2023-12-01').all())
+            self.assertTrue(forecast['Date'].eq('2023-12-01').all())
+
+        december_csv = forecaster.output_dir / 'METEO_RU_Precip_2023-12.csv'
+        december = pd.read_csv(december_csv)
+        self.assertEqual(december['Date'].unique().tolist(), ['2023-12-01'])
+        self.assertEqual(december['Fact'].dropna().tolist(), [0.0])
+        self.assertEqual(annual_csv.read_bytes(), annual_contents)
+        self.assertFalse((forecaster.output_dir / 'METEO_RU_Precip_2023.csv').exists())
+        with patch.object(forecaster, '_fit_predict_model', side_effect=AssertionError('CSV cache was ignored')):
+            results = self.run_with_cp1251_stdout(forecaster.run, 2023, 'METEO_RU', target_month=12)
+        self.assertEqual(results.count('[SKIP]'), 2)
+
     def test_validation_forecasts_full_year_and_trains_only_on_completed_years(self):
         validator = LongTermValidator(self.output_dir, self.output_dir)
         validator.model_classes = {'Random Forest': validator.model_classes['Random Forest']}
@@ -337,14 +364,14 @@ class ForecastHistoryTest(unittest.TestCase):
             Source_Version=CRU_SOURCE_VERSION,
         )
         cases = (
-            (StandardForecastVisualizer, '{dataset}_{variable}_{period}.csv', '2024', '2023', 2024),
-            (ValidationVisualizer, 'Validation_{dataset}_{variable}_{period}.csv', '1990-2020', '1990-2024', 2020),
+            (StandardForecastVisualizer, '{dataset}_{variable}_{period}.csv', '2024', '2023', '2024-04-01'),
+            (ValidationVisualizer, 'Validation_{dataset}_{variable}_{period}.csv', '1990-2020', '1990-2024', '2020-01-01'),
         )
-        for visualize, pattern, period, other_period, year in cases:
+        for visualize, pattern, period, other_period, date in cases:
             with self.subTest(visualize=visualize):
                 visualizer = visualize.__new__(visualize)
                 visualizer.csv_dir = Path(self.output_dir)
-                records = forecast.assign(Date=f'{year}-01-01')
+                records = forecast.assign(Date=date)
                 if visualize is ValidationVisualizer:
                     records = records.assign(Forecast_Mode=ANNUAL_FORECAST_MODE)
                 for dataset in ('METEO_RU', 'CRU_CEDA'):
@@ -444,6 +471,64 @@ class ForecastGraphTest(unittest.TestCase):
 
 
 class ForecastMapTest(unittest.TestCase):
+    def test_winter_maps_and_graph_use_december_from_the_previous_year(self):
+        from kursach011_modules.visualizer import StandardForecastVisualizer
+
+        records = pd.DataFrame([
+            ('2023-01-01', 5., 50.),
+            ('2023-12-01', 10., 10.),
+            ('2024-01-01', 20., 20.),
+            ('2024-02-01', 30., 30.),
+            ('2024-04-01', 40., 40.),
+            ('2024-12-01', 50., 90.),
+        ], columns=['Date', 'Fact', 'Forecast']).assign(
+            WMO='A', Latitude=50., Longitude=40., Model='K-Neighbors', Source_Version=CRU_SOURCE_VERSION,
+        )
+        cases = (('2023-12', True), ('2023', True), (None, True), ('2023-12', False))
+        for december_file, has_february in cases:
+            with self.subTest(december_file=december_file, has_february=has_february), TemporaryDirectory() as output:
+                visualizer = StandardForecastVisualizer.__new__(StandardForecastVisualizer)
+                visualizer.csv_dir = Path(output)
+                current_year = records.loc[records.Date.str.startswith('2024')]
+                if not has_february:
+                    current_year = current_year.loc[current_year.Date.ne('2024-02-01')]
+                current_year.to_csv(visualizer.csv_dir / 'CRU_CEDA_Precip_2024.csv', index=False)
+                if december_file is not None:
+                    records.loc[records.Date.str.startswith(december_file)].to_csv(
+                        visualizer.csv_dir / f'CRU_CEDA_Precip_{december_file}.csv', index=False,
+                    )
+
+                messages = StringIO()
+                with (
+                    patch.object(visualizer, '_plot_full_graph') as graph,
+                    patch.object(visualizer, '_save_map_netcdf_and_png') as save_map,
+                    redirect_stdout(messages),
+                ):
+                    visualizer.run(2024)
+
+                annual_dates = graph.call_args_list[0].args[0].Date.dt.strftime('%Y-%m-%d').tolist()
+                self.assertEqual(annual_dates, current_year.Date.tolist())
+                maps = {call.args[2]: call.args for call in save_map.call_args_list}
+                self.assertIn('CRU_CEDA_Precip_K-Neighbors_2024_Spring_Accuracy', maps)
+                winter_maps = {name for name in maps if '_Winter_' in name}
+                if december_file is None or not has_february:
+                    self.assertFalse(winter_maps)
+                    self.assertEqual(graph.call_count, 1)
+                    self.assertIn('зима пропущена', messages.getvalue())
+                    continue
+
+                winter_prefix = 'CRU_CEDA_Precip_K-Neighbors_2023-2024_Winter'
+                self.assertEqual(winter_maps, {f'{winter_prefix}_Accuracy', f'{winter_prefix}_Correlation'})
+                winter_accuracy = maps[f'{winter_prefix}_Accuracy']
+                self.assertEqual(winter_accuracy[0].N_Pairs.tolist(), [3])
+                self.assertEqual(winter_accuracy[0].Accuracy.tolist(), [100.])
+                period = 'Зима 2023/24 (декабрь 2023 — февраль 2024)'
+                self.assertIn(period, winter_accuracy[6])
+                self.assertEqual(graph.call_count, 2)
+                winter_graph = graph.call_args_list[1].args
+                self.assertEqual(winter_graph[0].Date.dt.strftime('%Y-%m').tolist(), ['2023-12', '2024-01', '2024-02'])
+                self.assertEqual(winter_graph[3:], (period, 'Graph_CRU_CEDA_Precip_2023-2024_Winter'))
+
     def test_station_metrics_keep_existing_tolerances_and_score_colocated_stations_separately(self):
         from kursach011_modules.visualizer import BaseVisualizer
 
