@@ -471,7 +471,7 @@ class ForecastGraphTest(unittest.TestCase):
 
 
 class ForecastMapTest(unittest.TestCase):
-    def test_maps_skip_failed_rasters_and_keep_point_outputs(self):
+    def test_seasonal_pearson_skips_failed_masks_and_keeps_sparse_station_markers(self):
         import geopandas as gpd
         from matplotlib.collections import PathCollection, QuadMesh
         from matplotlib.figure import Figure
@@ -492,15 +492,14 @@ class ForecastMapTest(unittest.TestCase):
                 ax = figure.axes[0]
                 rendered[Path(path).name] = (ax.get_xlabel(), [type(item) for item in ax.collections])
 
-            def save(name, *, seasonal=False):
+            def save(name):
                 visualizer._save_map_netcdf_and_png(
-                    metrics, 'Correlation', name, 'METEO_RU', 'DTR', 'K-Neighbors', seasonal=seasonal,
+                    metrics, 'Correlation', name, 'METEO_RU', 'DTR', 'K-Neighbors', seasonal=True,
                 )
 
             messages = StringIO()
             with patch.object(Figure, 'savefig', capture_map), redirect_stdout(messages):
                 save('missing_mask')
-                save('point_map', seasonal=True)
                 visualizer.mask = gpd.GeoSeries([box(39, 49, 42, 52)], crs='EPSG:4326')
                 with patch.object(RasterArray, 'clip', side_effect=ValueError('invalid geometry')):
                     save('failed_clip')
@@ -508,10 +507,9 @@ class ForecastMapTest(unittest.TestCase):
 
             self.assertIn('missing_mask', messages.getvalue())
             self.assertIn('не найден слой стран', messages.getvalue())
-            self.assertIn('point_map.nc', messages.getvalue())
             self.assertIn('failed_clip', messages.getvalue())
             self.assertIn('invalid geometry', messages.getvalue())
-            self.assertEqual(set(rendered), {'point_map.png', 'point_map.tif', 'sparse_stations.png', 'sparse_stations.tif'})
+            self.assertEqual(set(rendered), {'sparse_stations.png', 'sparse_stations.tif'})
             self.assertEqual(list(visualizer.out_maps_nc.glob('*.nc')), [visualizer.out_maps_nc / 'sparse_stations.nc'])
             for xlabel, collection_types in rendered.values():
                 self.assertNotIn('0,05°', xlabel)
@@ -609,7 +607,7 @@ class ForecastMapTest(unittest.TestCase):
             (6, 'B', 52, 40, 0., 1.),
             (7, 'B', 52, 40, 0., 2.),
             (8, 'B', 52, 40, 5., np.inf),
-            (6, 'C', 51, 41, np.nan, 1.),
+            (6, 'C', 51, 43.25, np.nan, 1.),
             (6, 'D', 50, 43, 0., 1.),
             (7, 'D', 50, 43, 5., 6.),
             (6, 'E', 52, 43, 5., 5.),
@@ -625,7 +623,7 @@ class ForecastMapTest(unittest.TestCase):
             (ValidationVisualizer, validation_filename('METEO_RU', 'Precip'), 2020,
              'ValidMap_METEO_RU_Precip_K-Neighbors'),
         )
-        expected_counts = {(40, 50): '1', (40, 52): '2', (41, 51): '0', (43, 50): '2', (43, 52): '3', (44, 51): '2'}
+        expected_counts = {(40, 50): '1', (40, 52): '2', (43.25, 51): '0', (43, 50): '2', (43, 52): '3', (44, 51): '2'}
         original_savefig = Figure.savefig
 
         for visualizer_class, filename, year, prefix in cases:
@@ -675,14 +673,15 @@ class ForecastMapTest(unittest.TestCase):
                         self.assertEqual(png.format, 'PNG')
                     with Image.open(visualizer.out_maps_tiff / f'{stem}.tif') as tiff:
                         self.assertEqual(tiff.format, 'TIFF')
-                    points_only = metric == 'Correlation' and year == 2024
+                    seasonal_pearson = metric == 'Correlation' and year == 2024
                     for ext in ('png', 'tif'):
                         counts, unscored, text, xlabel, has_fill, colored = rendered[f'{stem}.{ext}']
                         self.assertEqual(counts, expected_counts)
-                        self.assertEqual(unscored, {(41, 51)} if metric == 'Accuracy' else {(40, 50), (40, 52), (41, 51)})
-                        self.assertEqual('До трёх пар' in text, points_only)
-                        self.assertEqual(has_fill, not points_only)
-                        self.assertEqual('0,05°' in xlabel, has_fill)
+                        expected_unscored = {(43.25, 51)} if metric == 'Accuracy' else {(40, 50), (40, 52), (43.25, 51)}
+                        self.assertEqual(unscored, expected_unscored)
+                        self.assertEqual('До трёх пар' in text, seasonal_pearson)
+                        self.assertTrue(has_fill)
+                        self.assertIn('0,05°', xlabel)
                         if metric == 'Correlation':
                             self.assertEqual(colored.keys(), {(43, 50), (43, 52), (44, 51)})
                             np.testing.assert_allclose(list(colored.values()), [1., 0., -1.], atol=1e-12)
@@ -693,5 +692,8 @@ class ForecastMapTest(unittest.TestCase):
                         self.assertEqual(grid.attrs['grid_step_degrees'], 0.05)
                         self.assertTrue(grid.where(grid.longitude > 43.5, drop=True).isnull().all().item())
                         self.assertGreater(finite.size, 0)
+                        self.assertTrue(grid.sel(latitude=51, longitude=43.25, method='nearest').notnull().item())
+                        if metric == 'Correlation':
+                            self.assertTrue(grid.sel(latitude=51, longitude=42, method='nearest').isnull().item())
                         if metric == 'Accuracy':
                             np.testing.assert_allclose(finite, 100.)

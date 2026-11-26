@@ -228,7 +228,6 @@ class BaseVisualizer:
         has_estimate = np.isfinite(metrics_df[metric_name])
         scored = metrics_df.loc[has_estimate]
         unscored = metrics_df.loc[~has_estimate]
-        points_only = seasonal and metric_name == 'Correlation'
 
         if metric_name == 'Correlation':
             cmap, vmin, vmax = 'coolwarm', -1, 1
@@ -244,12 +243,11 @@ class BaseVisualizer:
             )
             if vmin is not None:
                 da = da.clip(min=vmin, max=vmax)
-            da = self.clip_map(da, f'{filename_base}.nc' if points_only else filename_base)
-            if da is None and not points_only:
+            da = self.clip_map(da, filename_base)
+            if da is None:
                 return
-            if da is not None:
-                da.attrs.update(interpolation='cubic', grid_step_degrees=MAP_GRID_STEP)
-                da.to_netcdf(self.out_maps_nc / f"{filename_base}.nc")
+            da.attrs.update(interpolation='cubic', grid_step_degrees=MAP_GRID_STEP)
+            da.to_netcdf(self.out_maps_nc / f"{filename_base}.nc")
             
             # --- 4. ОТРИСОВКА PNG (ФИНАЛЬНЫЙ СТИЛЬ) ---
             fig, ax = plt.subplots(figsize=(18, 6))
@@ -263,7 +261,7 @@ class BaseVisualizer:
                                   linewidth=0.2,         # <=== ЕЩЕ ТОНЬШЕ
                                   zorder=0)
             
-            has_fill = not points_only and np.isfinite(da.values).any()
+            has_fill = np.isfinite(da.values).any()
             if has_fill:
                 im = da.plot(ax=ax, cmap=cmap, vmin=vmin, vmax=vmax, add_colorbar=False, zorder=1)
             else:
@@ -279,7 +277,7 @@ class BaseVisualizer:
                     edgecolors='white', linewidths=0.5, s=26, label='Нет оценки', zorder=4,
                 )
                 ax.legend(loc='lower left')
-            if not points_only and not scored.empty and not has_fill:
+            if not scored.empty and not has_fill:
                 ax.text(
                     0.99, 0.02, 'Значения показаны в точках станций', transform=ax.transAxes,
                     ha='right', va='bottom', fontsize=9,
@@ -301,7 +299,7 @@ class BaseVisualizer:
             ru_metric = RU_TITLES.get(metric_name, metric_name)
             
             title = f"{ru_metric}\n{ru_model} | {ru_var}\n{ru_dataset} {extra_info}"
-            if points_only:
+            if seasonal and metric_name == 'Correlation':
                 title += '\nДо трёх пар на станцию. При двух парах с изменяющимися рядами r = −1 или +1.'
             ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
             xlabel = 'Долгота\nЧисло у станции — количество пар «факт — прогноз»'
