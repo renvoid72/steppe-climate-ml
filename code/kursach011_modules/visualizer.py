@@ -4,15 +4,17 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import patheffects
+from matplotlib.text import Text
 from scipy.interpolate import griddata
+from scipy.spatial import QhullError
 import xarray as xr
 from itertools import product
 from pathlib import Path
 import warnings
-import os
 
 from .forecast_engine import read_prediction_csv, read_validation_csv
-from .forecast_metrics import regional_forecast_summary
+from .forecast_metrics import paired_predictions, regional_forecast_summary
 from .project_settings import (
     ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR, forecast_filename, validation_filename,
 )
@@ -105,36 +107,98 @@ class BaseVisualizer:
             except: pass
 
     def _calculate_metrics(self, df, target_var):
-        def compute(group):
-            if len(group) < 2: corr = 0
-            else: corr = group['Forecast'].corr(group['Fact'])
-            
-            abs_err = np.abs(group['Forecast'] - group['Fact'])
-            if target_var == 'DTR': threshold = 3.0
-            else: threshold = np.maximum(5.0, 0.2 * group['Fact'])
-            
-            hits = (abs_err <= threshold).sum()
-            accuracy = (hits / len(group)) * 100.0
-            return pd.Series({'Correlation': corr, 'Accuracy': accuracy})
+        station_columns = ['WMO', 'Latitude', 'Longitude']
+        located = np.isfinite(df[['Latitude', 'Longitude']]).all(axis=1)
+        metrics = []
+        for station, group in df.loc[located].groupby(station_columns):
+            pairs = paired_predictions(group)
+            count = len(pairs)
+            fact, forecast = pairs['Fact'], pairs['Forecast']
+            correlation = np.nan
+            if count >= 2 and fact.nunique() > 1 and forecast.nunique() > 1:
+                correlation = fact.corr(forecast)
 
-        return df.groupby(['Latitude', 'Longitude']).apply(compute).reset_index().fillna(0)
+            threshold = 3.0 if target_var == 'DTR' else np.maximum(5.0, 0.2 * fact)
+            accuracy = (forecast.sub(fact).abs() <= threshold).mean() * 100
+            metrics.append((*station, count, correlation, accuracy))
 
-    def _save_map_netcdf_and_png(self, metrics_df, metric_name, filename_base, dataset, var, model, extra_info=""):
+        return pd.DataFrame(metrics, columns=[*station_columns, 'N_Pairs', 'Correlation', 'Accuracy'])
+
+    @staticmethod
+    def _annotate_pair_counts(ax, metrics_df):
+        ax.apply_aspect()
+        renderer = ax.figure.canvas.get_renderer()
+        pixels_per_point = renderer.points_to_pixels(1)
+        station_x, station_y = ax.transData.transform(metrics_df[['Longitude', 'Latitude']]).T
+        offsets = sorted(product(range(-48, 49, 4), repeat=2), key=lambda offset: offset[0] ** 2 + offset[1] ** 2)
+        used_boxes = []
+
+        for station in metrics_df.itertuples(index=False):
+            label = ax.annotate(
+                str(station.N_Pairs), (station.Longitude, station.Latitude),
+                textcoords='offset points', xytext=(0, 0), ha='center', va='center', fontsize=7, zorder=5,
+                path_effects=[patheffects.withStroke(linewidth=1.6, foreground='white')],
+                arrowprops={'arrowstyle': '-', 'color': '#333333', 'linewidth': 0.5, 'shrinkB': 3},
+            )
+            label.update_positions(renderer)
+            center_box = Text.get_window_extent(label, renderer).padded(1.5 * pixels_per_point)
+            chosen = None
+            # Выбираем ближайшее свободное место, учитывая маркеры и уже размещённые подписи.
+            for dx, dy in offsets:
+                box = center_box.translated(dx * pixels_per_point, dy * pixels_per_point)
+                if any(box.overlaps(used) for used in used_boxes):
+                    continue
+                if chosen is None:
+                    chosen = (dx, dy), box
+                marker_box = box.padded(3 * pixels_per_point)
+                covers_marker = np.any(
+                    (marker_box.xmin < station_x) & (station_x < marker_box.xmax)
+                    & (marker_box.ymin < station_y) & (station_y < marker_box.ymax)
+                )
+                if not covers_marker:
+                    chosen = (dx, dy), box
+                    break
+            offset, box = chosen if chosen is not None else ((0, 0), center_box)
+            label.set_position(offset)
+            label.arrow_patch.set_visible(max(map(abs, offset)) > 8)
+            used_boxes.append(box)
+
+    def _save_map_netcdf_and_png(
+        self, metrics_df, metric_name, filename_base, dataset, var, model, extra_info="", *, seasonal=False,
+    ):
+        if metrics_df.empty:
+            return
+
         # 1. Сетка
         lat_min, lat_max = metrics_df['Latitude'].min() - 0.5, metrics_df['Latitude'].max() + 0.5
         lon_min, lon_max = metrics_df['Longitude'].min() - 0.5, metrics_df['Longitude'].max() + 0.5
         
         grid_lat, grid_lon = np.mgrid[lat_min:lat_max:0.05, lon_min:lon_max:0.05]
-        points = metrics_df[['Latitude', 'Longitude']].values
-        values = metrics_df[metric_name].values
-        
-        try:
-            # 2. Интерполяция
-            grid = griddata(points, values, (grid_lat, grid_lon), method='cubic')
-            
-            if metric_name == 'Accuracy': grid = np.clip(grid, 0, 100)
-            elif metric_name == 'Correlation': grid = np.clip(grid, -1, 1)
+        has_estimate = np.isfinite(metrics_df[metric_name])
+        scored = metrics_df.loc[has_estimate]
+        unscored = metrics_df.loc[~has_estimate]
+        # В сетку попадают только точки с рассчитанной метрикой.
+        grid = np.full(grid_lat.shape, np.nan)
+        if len(scored) >= 3:
+            try:
+                grid = griddata(
+                    scored[['Latitude', 'Longitude']], scored[metric_name], (grid_lat, grid_lon), method='cubic',
+                )
+            except QhullError:
+                # При совпадающих или коллинеарных точках оценка остаётся видна на маркерах.
+                pass
 
+        if metric_name == 'Correlation':
+            cmap, vmin, vmax = 'coolwarm', -1, 1
+        elif metric_name == 'Accuracy':
+            cmap, vmin, vmax = 'RdYlGn', 0, 100
+        else:
+            cmap, vmin, vmax = 'viridis', None, None
+        if vmin is not None:
+            grid = np.clip(grid, vmin, vmax)
+        
+        fig = None
+        try:
             # 3. Xarray
             da = xr.DataArray(
                 grid,
@@ -164,17 +228,24 @@ class BaseVisualizer:
                                   linewidth=0.2,         # <=== ЕЩЕ ТОНЬШЕ
                                   zorder=0)
             
-            # В. ЦВЕТА
-            if metric_name == 'Correlation':
-                cmap, vmin, vmax = 'coolwarm', -1, 1
-            elif metric_name == 'Accuracy':
-                cmap, vmin, vmax = 'RdYlGn', 0, 100
-            else: 
-                cmap, vmin, vmax = 'viridis', None, None
-
             # Г. ДАННЫЕ
-            # zorder=1 (поверх карты)
-            da.plot(ax=ax, cmap=cmap, vmin=vmin, vmax=vmax, add_colorbar=False, zorder=1, alpha=1.0)
+            im = da.plot(ax=ax, cmap=cmap, vmin=vmin, vmax=vmax, add_colorbar=False, zorder=1, alpha=1.0)
+            if not scored.empty:
+                ax.scatter(
+                    scored['Longitude'], scored['Latitude'], c=scored[metric_name], cmap=im.cmap, norm=im.norm,
+                    edgecolors='#333333', linewidths=0.5, s=16, zorder=3,
+                )
+            if not unscored.empty:
+                ax.scatter(
+                    unscored['Longitude'], unscored['Latitude'], color='#595959', marker='X',
+                    edgecolors='white', linewidths=0.5, s=26, label='Нет оценки', zorder=4,
+                )
+                ax.legend(loc='lower left')
+            if not scored.empty and not np.isfinite(da.values).any():
+                ax.text(
+                    0.99, 0.02, 'Значения показаны в точках станций', transform=ax.transAxes,
+                    ha='right', va='bottom', fontsize=9,
+                )
             
             # Б. СЕТКА (GRID):
             # zorder=2 (ПОВЕРХ ДАННЫХ)
@@ -182,7 +253,6 @@ class BaseVisualizer:
             ax.grid(True, linestyle=':', alpha=0.4, color='black', linewidth=0.8, zorder=2)
 
             # Д. ЛЕГЕНДА
-            im = ax.collections[-1] # Берем объект heatmap для легенды
             cbar = plt.colorbar(im, ax=ax, fraction=0.015, pad=0.02, shrink=0.7)
             cbar.set_label(RU_TITLES.get(metric_name, metric_name), fontsize=10)
             
@@ -193,15 +263,18 @@ class BaseVisualizer:
             ru_metric = RU_TITLES.get(metric_name, metric_name)
             
             title = f"{ru_metric}\n{ru_model} | {ru_var}\n{ru_dataset} {extra_info}"
+            if seasonal and metric_name == 'Correlation':
+                title += '\nДо трёх пар на станцию. При двух парах с изменяющимися рядами r = −1 или +1.'
             ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
-            ax.set_xlabel("Долгота", fontsize=10)
+            ax.set_xlabel('Долгота\nЧисло у станции — количество пар «факт — прогноз»', fontsize=10)
             ax.set_ylabel("Широта", fontsize=10)
             
             # Ж. ЗУМ
             ax.set_xlim(lon_min - 10, lon_max + 15) 
             ax.set_ylim(lat_min - 8, lat_max + 12)
             
-            plt.tight_layout()
+            fig.tight_layout(rect=(0, 0.05, 1, 0.95))
+            self._annotate_pair_counts(ax, metrics_df)
             
             # 1. Сохраняем PNG (обычное качество)
             plt.savefig(self.out_maps_png / f"{filename_base}.png", dpi=200)
@@ -214,10 +287,11 @@ class BaseVisualizer:
                 pil_kwargs={'compression': 'tiff_lzw'}
             )
             
-            plt.close()
-            
         except Exception as e:
             print(f"    Ошибка рисования {filename_base}: {e}")
+        finally:
+            if fig is not None:
+                plt.close(fig)
 
     def _plot_full_graph(self, df, dataset, var, year_info, filename):
         models = df['Model'].dropna().unique()
@@ -276,7 +350,9 @@ class StandardForecastVisualizer(BaseVisualizer):
                         ru_season = RU_TITLES.get(s_name, s_name)
                         for met in ['Correlation', 'Accuracy']:
                             fname = f"{dataset}_{var}_{model}_{year}_{s_name}_{met}"
-                            self._save_map_netcdf_and_png(metrics, met, fname, dataset, var, model, f"({ru_season} {year})")
+                            self._save_map_netcdf_and_png(
+                                metrics, met, fname, dataset, var, model, f"({ru_season} {year})", seasonal=True,
+                            )
             except Exception as e: print(f"  Ошибка: {e}")
 
 class ValidationVisualizer(BaseVisualizer):
@@ -300,7 +376,6 @@ class ValidationVisualizer(BaseVisualizer):
                 
                 self._plot_full_graph(df, dataset, var, f"Прямой прогноз на 12 мес., {years_range}", f"ValidGraph_{dataset}_{var}")
 
-                df = df.dropna(subset=['Forecast', 'Fact'])
                 for model in df['Model'].unique():
                     df_mod = df[df['Model'] == model]
                     metrics = self._calculate_metrics(df_mod, var)
