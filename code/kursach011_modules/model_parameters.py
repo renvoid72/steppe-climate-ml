@@ -55,11 +55,15 @@ def default_parameter_records():
 
 
 def read_model_parameters(path):
+    return load_model_parameters(path)[0]
+
+
+def load_model_parameters(path):
     """Загружает конфигурацию целиком. При отсутствии файла использует BEST_PARAMS."""
     try:
         content = path.read_text(encoding='utf-8')
     except FileNotFoundError:
-        return default_parameter_records()
+        return default_parameter_records(), 'BEST_PARAMS'
 
     try:
         records = json.loads(content)
@@ -72,7 +76,7 @@ def read_model_parameters(path):
                             raise TypeError(f'{mode}/{dataset}/{target}/{model}: parameters')
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f'{path}: не удалось прочитать параметры моделей ({exc}).') from exc
-    return records
+    return records, path.name
 
 
 def save_model_parameters(path, updates):

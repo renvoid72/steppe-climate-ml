@@ -299,8 +299,9 @@ class ModelParametersTest(TestCase):
         rows = monthly_data(2024, 2024).iloc[:1].assign(
             Forecast=1., Fact=1., Model=self.model, Target_Var=self.target,
         )
+        metadata = dict(source={'dataset': self.dataset}, target=self.target, evaluation_period=('2024-01', '2024-12'), models={})
         for engine in (standard, annual):
-            engine._save_predictions([rows], filename, self.dataset, hashes)
+            engine._save_predictions([rows], filename, self.dataset, hashes, **metadata)
             self.assertFalse(engine._load_cached_predictions(filename, self.dataset, self.target, hashes).empty)
         self.save_neighbors(ANNUAL_FORECAST_MODE, 42)
 
@@ -309,7 +310,7 @@ class ModelParametersTest(TestCase):
         self.assertFalse(standard._load_cached_predictions(filename, self.dataset, self.target, hashes).empty)
         with self.assertRaisesRegex(ValueError, 'изменились параметры моделей'):
             annual._load_cached_predictions(filename, self.dataset, self.target, hashes)
-        annual._save_predictions([rows], filename, self.dataset, hashes)
+        annual._save_predictions([rows], filename, self.dataset, hashes, **metadata)
         self.assertFalse(annual._load_cached_predictions(filename, self.dataset, self.target, hashes).empty)
         self.path.unlink()
         with self.assertRaisesRegex(ValueError, 'изменились параметры моделей'):

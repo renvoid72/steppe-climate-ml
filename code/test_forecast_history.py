@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
+import json
 import unittest
 from contextlib import redirect_stdout
+from hashlib import sha256
 from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -204,7 +206,10 @@ class ForecastHistoryTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, 'изменились правила отбора истории'):
             forecaster._load_cached_predictions(filename, 'METEO_RU', 'DTR', hashes)
-        forecaster._save_predictions([forecast], filename, 'METEO_RU', hashes)
+        forecaster._save_predictions(
+            [forecast], filename, 'METEO_RU', hashes, source={'dataset': 'METEO_RU'}, target='DTR',
+            evaluation_period=('2024-01', '2024-12'), models={},
+        )
         self.assertFalse(forecaster._load_cached_predictions(filename, 'METEO_RU', 'DTR', hashes).empty)
 
     def test_standard_forecast_replaces_legacy_cache_and_preserves_missing_facts(self):
@@ -332,7 +337,7 @@ class ForecastHistoryTest(unittest.TestCase):
         np.testing.assert_array_equal(results['Forecast'], results['Date'].dt.month)
         replaced = read_validation_csv(old_file, 'CRU_CEDA')
         self.assertEqual(len(replaced), 48)
-        _, hashes = validator._load_data_and_hashes('CRU_CEDA')
+        _, hashes, _ = validator._load_data_and_hashes('CRU_CEDA')
         self.assertFalse(validator._load_cached_predictions(old_file.name, 'CRU_CEDA', 'DTR', hashes).empty)
         mixed = pd.concat([replaced, legacy], ignore_index=True)
         mixed.to_csv(old_file, index=False)
@@ -367,7 +372,10 @@ class ForecastHistoryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'требуется результат расчёта'):
                 read_prediction_csv(output, 'CRU_CEDA')
 
-        validator._save_predictions([forecast], filename, 'CRU_CEDA', hashes)
+        validator._save_predictions(
+            [forecast], filename, 'CRU_CEDA', hashes, source={'dataset': 'CRU_CEDA'}, target='DTR',
+            evaluation_period=('1990-01', '2020-12'), models={},
+        )
         self.assertFalse(validator._load_cached_predictions(filename, 'CRU_CEDA', 'DTR', hashes).empty)
         result = read_prediction_csv(output, 'CRU_CEDA')
         self.assertEqual(result['Source_Version'].tolist(), [CRU_SOURCE_VERSION])
@@ -508,6 +516,50 @@ class ForecastCacheFreshnessTest(unittest.TestCase):
         updated = self.run_engines('CRU_CEDA')
         self.assertEqual(updated.log.count('в CSV отсутствует поле Input_Data_Hash'), 2)
         self.assertEqual(updated.log.count('[SKIP]'), 2)
+        self.assertEqual(self.run_engines('CRU_CEDA').log.count('[SKIP]'), 4)
+
+    def test_records_training_windows_parameters_and_source_for_both_modes(self):
+        result = self.run_engines('CRU_CEDA')
+        for path, mode, end, examples in (
+            (result.standard, 'monthly', '2023-12', 48),
+            (result.annual, 'direct_annual', '2023-12', 4),
+        ):
+            with self.subTest(mode=mode):
+                metadata = json.loads(path.with_suffix('.json').read_text(encoding='utf-8'))
+                self.assertEqual(metadata['source'], {
+                    'dataset': 'CRU_CEDA', 'version': CRU_SOURCE_VERSION,
+                    'files_sha256': {self.cru.relative_to(self.base).as_posix(): sha256(self.cru.read_bytes()).hexdigest()},
+                })
+                self.assertEqual(metadata['forecast_mode'], mode)
+                self.assertEqual(metadata['csv_sha256'], sha256(path.read_bytes()).hexdigest())
+                model = metadata['models']['K-Neighbors']
+                self.assertEqual(model['parameter_source'], 'BEST_PARAMS')
+                self.assertEqual(model['parameters']['n_neighbors'], 1)
+                self.assertEqual(model['training'][0], {
+                    'release_month': '2024-01', 'target_start_month': '2020-01',
+                    'target_end_month': end, 'examples': examples,
+                })
+                self.assertEqual(metadata['evaluation'], {
+                    'requested_start_month': '2024-01', 'requested_end_month': '2024-12',
+                    'months_with_pairs_by_model': {'K-Neighbors': [f'2024-{m:02d}' for m in range(1, 13)]},
+                })
+
+    def test_reused_cache_preserves_json_and_rebuilds_missing_or_unmatched_json(self):
+        result = self.run_engines('CRU_CEDA')
+        monthly = result.standard.with_suffix('.json')
+        annual = result.annual.with_suffix('.json')
+        saved = monthly.read_bytes()
+        self.assertEqual(self.run_engines('CRU_CEDA').log.count('[SKIP]'), 4)
+        self.assertEqual(monthly.read_bytes(), saved)
+
+        monthly.unlink()
+        metadata = json.loads(annual.read_text(encoding='utf-8'))
+        metadata['csv_sha256'] = 'invalid'
+        annual.write_text(json.dumps(metadata), encoding='utf-8')
+        update = self.run_engines('CRU_CEDA')
+        self.assertIn('отсутствует JSON со сведениями о расчёте', update.log)
+        self.assertIn('контрольная сумма CSV не совпадает', update.log)
+        self.assertEqual(update.log.count('[SKIP]'), 2)
         self.assertEqual(self.run_engines('CRU_CEDA').log.count('[SKIP]'), 4)
 
     def test_main_forces_all_csv_and_passes_the_available_validation_period_to_maps(self):

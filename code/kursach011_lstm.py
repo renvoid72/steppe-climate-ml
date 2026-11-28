@@ -24,10 +24,14 @@ from torch.utils.data import TensorDataset, DataLoader
 from kursach011_modules.annual_forecast import (
     ANNUAL_FORECAST_MODE, annual_prediction_rows, annual_splits, annual_targets, print_monthly_errors,
 )
-from kursach011_modules.forecast_engine import mark_prediction_source, prepare_monthly_forecast_data
+from kursach011_modules.forecast_engine import (
+    load_forecast_input_snapshot, mark_prediction_source, prepare_monthly_forecast_data,
+)
+from kursach011_modules.forecast_metadata import save_forecast_result, training_split
 from kursach011_modules.forecast_metrics import (
     calculate_climatology_comparison, format_forecast_metrics, paired_predictions, station_month_climatology,
 )
+from kursach011_modules.model_parameters import MONTHLY_FORECAST_MODE
 from kursach011_modules.project_settings import (
     ANALYSIS_YEAR, VALIDATION_START_YEAR, VALIDATION_END_YEAR,
     cru_csv_path, forecast_filename, results_dir, validation_filename,
@@ -47,6 +51,13 @@ VAL_CSV_DIR = RESULTS_DIR / "validation_results" / "csv_data"
 REPORT_FILE = RESULTS_DIR / "forecast_report.txt"
 
 FORECAST_COLUMNS = ['Date', 'WMO', 'Latitude', 'Longitude', 'Forecast', 'Fact', 'Model', 'Target_Var']
+LSTM_MODEL_NAME = 'LSTM Neural Network'
+LSTM_NETWORK = {'hidden_dim': 64, 'num_layers': 2, 'dropout': 0.2, 'head_dim': 32, 'head_dropout': 0.1}
+LSTM_SEED = 42
+LSTM_BATCH_SIZE = 256
+LSTM_OPTIMIZER = {'lr': 0.005, 'weight_decay': 1e-4}
+LSTM_HUBER_DELTA = 1.0
+LSTM_MAX_GRAD_NORM = 1.0
 
 # Подключение путей для импорта
 for p in [str(CODE_DIR), str(MODULES_DIR), str(PROJECT_DIR)]:
@@ -89,7 +100,10 @@ class ClimateLSTM(nn.Module):
     Глубокая рекуррентная нейросеть LSTM для временных рядов климатических показателей.
     Состоит из 2 слоев LSTM с Dropout и полносвязной регрессионной головки (MLP Head).
     """
-    def __init__(self, input_dim, hidden_dim=64, num_layers=2, dropout=0.2, output_dim=1):
+    def __init__(
+        self, input_dim, hidden_dim=LSTM_NETWORK['hidden_dim'], num_layers=LSTM_NETWORK['num_layers'],
+        dropout=LSTM_NETWORK['dropout'], output_dim=1,
+    ):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_dim,
@@ -98,11 +112,12 @@ class ClimateLSTM(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0
         )
+        head_dim = LSTM_NETWORK['head_dim']
         self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
+            nn.Linear(hidden_dim, head_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(32, output_dim)
+            nn.Dropout(LSTM_NETWORK['head_dropout']),
+            nn.Linear(head_dim, output_dim)
         )
 
     def forward(self, x):
@@ -149,6 +164,13 @@ class LSTMFORECASTENGINE:
         df_monthly = prepare_monthly_forecast_data(df_monthly, dataset_name)
         df_monthly = df_monthly.sort_values(by=['WMO', 'Date']).reset_index(drop=True)
         return df_monthly
+
+    def _load_input_snapshot(self, dataset_name):
+        try:
+            return load_forecast_input_snapshot(self.base_dir, dataset_name, self.load_data)
+        except FileNotFoundError as error:
+            print(f'  ОШИБКА: Не найден файл {error.filename}')
+            return pd.DataFrame(), None
 
     def _prepare_features_df(self, df):
         """Добавление гармонических сезонных признаков."""
@@ -237,10 +259,10 @@ class LSTMFORECASTENGINE:
 
         return X_arr, y_arr, date_arr, wmo_arr, lat_arr, lon_arr
 
-    def _train_lstm_model(self, X_train, y_train, target_var, epochs=25, batch_size=256):
+    def _train_lstm_model(self, X_train, y_train, target_var, epochs=25, batch_size=LSTM_BATCH_SIZE):
         """Обучение LSTM сети на тензорах истории."""
-        torch.manual_seed(42)
-        np.random.seed(42)
+        torch.manual_seed(LSTM_SEED)
+        np.random.seed(LSTM_SEED)
 
         N, seq_len, n_feat = X_train.shape
 
@@ -264,8 +286,8 @@ class LSTMFORECASTENGINE:
 
         # Модель
         model = ClimateLSTM(input_dim=n_feat, output_dim=y_matrix.shape[1]).to(self.device)
-        criterion = nn.HuberLoss(delta=1.0)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.005, weight_decay=1e-4)
+        criterion = nn.HuberLoss(delta=LSTM_HUBER_DELTA)
+        optimizer = torch.optim.AdamW(model.parameters(), **LSTM_OPTIMIZER)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
         model.train()
@@ -276,11 +298,29 @@ class LSTMFORECASTENGINE:
                 out = model(bx)
                 loss = criterion(out, by)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=LSTM_MAX_GRAD_NORM)
                 optimizer.step()
             scheduler.step()
 
         return model, scaler, y_scaler
+
+    def _model_metadata(self, input_dim, output_dim, epochs, training):
+        if not training:
+            return {}
+        return {LSTM_MODEL_NAME: {
+            'parameters': {
+                'lookback_months': self.lookback,
+                'network': {**LSTM_NETWORK, 'input_dim': input_dim, 'output_dim': output_dim},
+                'epochs': epochs,
+                'batch_size': LSTM_BATCH_SIZE,
+                'optimizer': {'name': 'AdamW', **LSTM_OPTIMIZER},
+                'scheduler': {'name': 'CosineAnnealingLR', 'T_max': epochs},
+                'loss': {'name': 'HuberLoss', 'delta': LSTM_HUBER_DELTA},
+                'max_grad_norm': LSTM_MAX_GRAD_NORM,
+                'seed': LSTM_SEED,
+            },
+            'training': training,
+        }}
 
     def _predict_lstm(self, model, scaler, y_scaler, X_test, target_var):
         """Инференс обученной LSTM модели на тестовых окнах."""
@@ -312,7 +352,7 @@ class LSTMFORECASTENGINE:
         print("="*80)
 
         t_load_start = time.perf_counter()
-        df_full = self.load_data(dataset_name)
+        df_full, source = self._load_input_snapshot(dataset_name)
         t_load_end = time.perf_counter()
         print(f"  [Время загрузки данных и базовой предобработки: {t_load_end - t_load_start:.3f} сек]")
 
@@ -320,17 +360,20 @@ class LSTMFORECASTENGINE:
             return
 
         climatology = station_month_climatology(df_full, [target_year])
+        evaluation_period = (f'{target_year}-01', f'{target_year}-12')
+        epochs = 20
         STD_CSV_DIR.mkdir(parents=True, exist_ok=True)
         for target_var in ['DTR', 'Precip']:
             fname = forecast_filename(dataset_name, target_var, target_year)
             print(f"\n---> Параметр: {target_var} <---")
-            print(f"\n  * Модель: LSTM Neural Network")
+            print(f"\n  * Модель: {LSTM_MODEL_NAME}")
 
             # Формируем все временные окна
             X_all, y_all, dates_all, wmo_all, lats_all, lons_all = self._build_sequences(df_full, target_var)
             has_fact = np.isfinite(y_all)
 
             all_res_rows = []
+            training = []
             total_fit_time = 0.0
             total_pred_time = 0.0
             total_samples = 0
@@ -353,9 +396,10 @@ class LSTMFORECASTENGINE:
 
                 # 1. Обучение сети
                 t_fit_start = time.perf_counter()
-                model, feat_scaler, y_scaler = self._train_lstm_model(X_train, y_train, target_var, epochs=20)
+                model, feat_scaler, y_scaler = self._train_lstm_model(X_train, y_train, target_var, epochs=epochs)
                 t_fit_end = time.perf_counter()
                 fit_t = t_fit_end - t_fit_start
+                training.append(training_split(forecast_date, dates_all[train_mask]))
 
                 # 2. Инференс прогноза
                 t_pred_start = time.perf_counter()
@@ -383,7 +427,7 @@ class LSTMFORECASTENGINE:
                         'Longitude': test_lon[i],
                         'Forecast': float(preds[i]),
                         'Fact': float(y_test[i]),
-                        'Model': 'LSTM Neural Network',
+                        'Model': LSTM_MODEL_NAME,
                         'Target_Var': target_var
                     })
 
@@ -404,13 +448,16 @@ class LSTMFORECASTENGINE:
             # Сохранение CSV
             df_out = df_out.round({'Forecast': 4, 'Fact': 4})
             mark_prediction_source(df_out, dataset_name)
-            df_out.to_csv(STD_CSV_DIR / fname, index=False)
+            save_forecast_result(
+                STD_CSV_DIR / fname, df_out, source=source, mode=MONTHLY_FORECAST_MODE, target=target_var,
+                evaluation_period=evaluation_period, models=self._model_metadata(X_all.shape[2], 1, epochs, training),
+            )
 
             model_info = {
                 'Блок': f'Стандартный прогноз ({target_year})',
                 'Датасет': dataset_name,
                 'Параметр': target_var,
-                'Модель': 'LSTM Neural Network',
+                'Модель': LSTM_MODEL_NAME,
             }
             self.summary_table.append({
                 **model_info,
@@ -431,7 +478,7 @@ class LSTMFORECASTENGINE:
         print("="*80)
 
         t_load_start = time.perf_counter()
-        df_full = self.load_data(dataset_name)
+        df_full, source = self._load_input_snapshot(dataset_name)
         t_load_end = time.perf_counter()
         print(f"  [Время загрузки данных и базовой предобработки: {t_load_end - t_load_start:.3f} сек]")
 
@@ -445,18 +492,21 @@ class LSTMFORECASTENGINE:
             return
 
         climatology = station_month_climatology(df_full, test_years)
+        evaluation_period = (f'{split_year}-01', f'{end_year}-12')
+        epochs = 15
         history = df_full.loc[df_full['Year'] < final_year]
         VAL_CSV_DIR.mkdir(parents=True, exist_ok=True)
         for target_var in ['DTR', 'Precip']:
             fname = validation_filename(dataset_name, target_var, split_year, final_year)
             print(f"\n---> Параметр: {target_var} <---")
-            print(f"\n  * Модель: LSTM Neural Network")
+            print(f"\n  * Модель: {LSTM_MODEL_NAME}")
 
             X_all, _, dates, wmo, lat, lon = self._build_sequences(history, target_var, annual=True)
             anchors = pd.DataFrame({'Date': dates, 'WMO': wmo, 'Latitude': lat, 'Longitude': lon})
             targets = annual_targets(df_full, anchors, target_var).astype(np.float32)
 
             results = []
+            training = []
             total_fit_time = 0.0
             total_pred_time = 0.0
 
@@ -466,15 +516,16 @@ class LSTMFORECASTENGINE:
 
                 t_fit_start = time.perf_counter()
                 model, feat_scaler, y_scaler = self._train_lstm_model(
-                    X_all[train_mask], targets[train_mask], target_var, epochs=15,
+                    X_all[train_mask], targets[train_mask], target_var, epochs=epochs,
                 )
                 total_fit_time += time.perf_counter() - t_fit_start
+                training.append(training_split(dates[test_mask][0], dates[train_mask], horizon_months=targets.shape[1]))
 
                 t_pred_start = time.perf_counter()
                 preds = self._predict_lstm(model, feat_scaler, y_scaler, X_all[test_mask], target_var)
                 total_pred_time += time.perf_counter() - t_pred_start
                 results.append(annual_prediction_rows(
-                    anchors.loc[test_mask], preds, targets[test_mask], 'LSTM Neural Network', target_var,
+                    anchors.loc[test_mask], preds, targets[test_mask], LSTM_MODEL_NAME, target_var,
                 ))
 
             df_out = pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=FORECAST_COLUMNS)
@@ -497,13 +548,17 @@ class LSTMFORECASTENGINE:
             df_out = df_out.reindex(columns=FORECAST_COLUMNS).round({'Forecast': 4, 'Fact': 4})
             df_out['Forecast_Mode'] = ANNUAL_FORECAST_MODE
             mark_prediction_source(df_out, dataset_name)
-            df_out.to_csv(VAL_CSV_DIR / fname, index=False)
+            save_forecast_result(
+                VAL_CSV_DIR / fname, df_out, source=source, mode=ANNUAL_FORECAST_MODE, target=target_var,
+                evaluation_period=evaluation_period,
+                models=self._model_metadata(X_all.shape[2], targets.shape[1], epochs, training),
+            )
 
             model_info = {
                 'Блок': f'Валидация ({split_year}-{final_year})',
                 'Датасет': dataset_name,
                 'Параметр': target_var,
-                'Модель': 'LSTM Neural Network',
+                'Модель': LSTM_MODEL_NAME,
             }
             self.summary_table.append({
                 **model_info,
