@@ -6,6 +6,7 @@
 сохранение строки прогноза. Тесты запускаются без обучения моделей.
 """
 
+import json
 import unittest
 from contextlib import redirect_stdout
 from importlib.util import find_spec
@@ -20,6 +21,7 @@ from pandas.testing import assert_frame_equal
 
 from kursach011_modules.forecast_engine import BaseForecaster
 from kursach011_modules.monthly_features import create_time_features
+from kursach011_modules.project_settings import cru_csv_path
 
 
 class MonthlyFeaturesTest(unittest.TestCase):
@@ -177,8 +179,12 @@ class LSTMCalendarWindowsTest(unittest.TestCase):
             self.source,
         ], ignore_index=True)
         source.loc[(source['WMO'] == 'B') & (source['Date'] == '2024-01-01'), 'Precip'] = np.nan
-        engine = lstm.LSTMFORECASTENGINE()
         output = Path(self.enterContext(TemporaryDirectory()))
+        engine = lstm.LSTMFORECASTENGINE(base_dir=output)
+        meteo = output / 'meteo_ru'
+        meteo.mkdir()
+        (meteo / 'all_steppe_data.txt').touch()
+        (meteo / 'stations_coords.txt').touch()
 
         def train(_features, targets, _variable, *, epochs):
             self.assertTrue(np.isfinite(targets).all())
@@ -206,6 +212,57 @@ class LSTMCalendarWindowsTest(unittest.TestCase):
         metrics = [row for row in engine.accuracy_table if row['Параметр'] == 'Precip']
         self.assertEqual([(row['N'], row['MAE']) for row in metrics], [(1, 43.0), (1, 43.0)])
         self.assertEqual([row['MAE климатологии'] for row in metrics], [24.0, 24.0])
+
+        metadata = json.loads((output / 'METEO_RU_Precip_2024.json').read_text(encoding='utf-8'))
+        self.assertEqual(metadata['source']['dataset'], 'METEO_RU')
+        self.assertEqual(set(metadata['source']['files_sha256']), {
+            'meteo_ru/all_steppe_data.txt', 'meteo_ru/stations_coords.txt',
+        })
+        self.assertEqual(metadata['evaluation']['months_with_pairs_by_model'], {lstm.LSTM_MODEL_NAME: ['2024-01']})
+        model = metadata['models'][lstm.LSTM_MODEL_NAME]
+        self.assertEqual(model['parameters']['epochs'], 20)
+        self.assertEqual(model['parameters']['lookback_months'], 12)
+        self.assertEqual(model['parameters']['network']['output_dim'], 1)
+        self.assertEqual([split['release_month'] for split in model['training']], ['2024-01', '2024-02'])
+
+    def test_annual_lstm_records_training_targets_and_months_with_facts(self):
+        import kursach011_lstm as lstm
+
+        output = Path(self.enterContext(TemporaryDirectory()))
+        dates = pd.date_range('2020-01-01', '2024-12-01', freq='MS').difference([pd.Timestamp('2024-06-01')])
+        cru = cru_csv_path(output)
+        cru.parent.mkdir(parents=True)
+        pd.DataFrame({
+            'WMO': 'A', 'Year': dates.year, 'Month': dates.month, 'Latitude': 45.0, 'Longitude': 60.0,
+            'DTR': 8.0, 'Precip': 20.0,
+        }).to_csv(cru, index=False)
+        engine = lstm.LSTMFORECASTENGINE(base_dir=output)
+
+        def predict(_model, _feature_scaler, _target_scaler, features, _variable):
+            return np.ones((len(features), 12), dtype=np.float32)
+
+        with (
+            patch.object(lstm, 'VAL_CSV_DIR', output),
+            patch.object(engine, '_train_lstm_model', return_value=(None, None, None)) as train,
+            patch.object(engine, '_predict_lstm', side_effect=predict),
+            redirect_stdout(StringIO()),
+        ):
+            engine.run_validation(2024, 'CRU_CEDA', end_year=2025)
+
+        metadata = json.loads((output / 'Validation_CRU_CEDA_DTR_2024-2024.json').read_text(encoding='utf-8'))
+        model = metadata['models'][lstm.LSTM_MODEL_NAME]
+        self.assertEqual(metadata['forecast_mode'], 'direct_annual')
+        self.assertEqual(metadata['evaluation']['requested_end_month'], '2025-12')
+        self.assertEqual(metadata['evaluation']['months_with_pairs_by_model'][lstm.LSTM_MODEL_NAME], [
+            f'2024-{month:02d}' for month in range(1, 13) if month != 6
+        ])
+        self.assertEqual(model['parameters']['epochs'], train.call_args_list[0].kwargs['epochs'])
+        self.assertEqual(model['parameters']['seed'], 42)
+        self.assertEqual(model['parameters']['network']['output_dim'], 12)
+        self.assertEqual(model['training'], [{
+            'release_month': '2024-01', 'target_start_month': '2021-01', 'target_end_month': '2023-12',
+            'examples': train.call_args_list[0].args[0].shape[0],
+        }])
 
     def test_lstm_keeps_tensor_and_date_types_when_all_windows_cross_a_gap(self):
         sparse = self.source.loc[

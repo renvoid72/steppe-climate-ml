@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
-from hashlib import file_digest, sha256
+from hashlib import sha256
 
 import pandas as pd
 import numpy as np
@@ -9,7 +9,6 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from pathlib import Path
-from tempfile import TemporaryDirectory
 import warnings
 
 from .annual_forecast import (
@@ -18,9 +17,12 @@ from .annual_forecast import (
 from .forecast_metrics import (
     calculate_climatology_comparison, format_forecast_metrics, paired_predictions, station_month_climatology,
 )
+from .forecast_metadata import (
+    check_forecast_metadata, input_file_state, save_forecast_result, sha256_file, training_split,
+)
 from .meteo_data import load_monthly_meteo
 from .mlp_diagnostics import MlpDiagnostics
-from .model_parameters import MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE, read_model_parameters
+from .model_parameters import MODEL_PARAMS_FILENAME, MONTHLY_FORECAST_MODE, load_model_parameters
 from .project_settings import CRU_VERSION, cru_csv_path, forecast_filename, mlp_diagnostics_dir, validation_filename
 from .monthly_features import (
     prepare_forecast_period,
@@ -76,6 +78,19 @@ def load_forecast_data(base_dir, dataset_name):
     return history
 
 
+def load_forecast_input_snapshot(base_dir, dataset_name, load_data):
+    paths = forecast_input_files(base_dir, dataset_name)
+    initial_state = input_file_state(paths)
+    files = {path.relative_to(base_dir).as_posix(): sha256_file(path) for path in paths}
+    data = load_data(dataset_name)
+    if input_file_state(paths) != initial_state:
+        raise ValueError(f'{dataset_name}: входные файлы изменились при загрузке. Повторите запуск.')
+    source = {'dataset': dataset_name, 'files_sha256': files}
+    if dataset_name == 'CRU_CEDA':
+        source['version'] = CRU_SOURCE_VERSION
+    return data, source
+
+
 def build_regressor(model_class, model_name, params, *, seed=42):
     model_args = {}
     if model_name in ('Random Forest', 'MLP Neural Network'):
@@ -106,12 +121,15 @@ def parameter_digest(params):
     return sha256(serialized.encode('utf-8')).hexdigest()
 
 
-def files_digest(paths):
+def combine_file_checksums(checksums):
     digest = sha256()
-    for path in paths:
-        with path.open('rb') as source:
-            digest.update(file_digest(source, 'sha256').digest())
+    for checksum in checksums:
+        digest.update(bytes.fromhex(checksum))
     return digest.hexdigest()
+
+
+def files_digest(paths):
+    return combine_file_checksums(sha256_file(path) for path in paths)
 
 
 # Хеш фиксируется при импорте, чтобы соответствовать загруженному коду.
@@ -120,11 +138,6 @@ FORECAST_CODE_HASH = files_digest(
         'forecast_engine.py', 'meteo_data.py', 'monthly_features.py', 'annual_forecast.py', 'mlp_diagnostics.py',
     )
 )
-
-
-def input_file_state(paths):
-    states = [path.stat() for path in paths]
-    return [(state.st_ino, state.st_size, state.st_mtime_ns) for state in states]
 
 
 def mark_prediction_source(df, dataset_name):
@@ -157,14 +170,14 @@ class BaseForecaster:
     def __init__(self, base_dir, root_output_dir, subfolder_name):
         self.base_dir = Path(base_dir)
         params_path = Path(root_output_dir) / MODEL_PARAMS_FILENAME
-        self.parameter_records = read_model_parameters(params_path)
+        self.parameter_records, self.parameter_source = load_model_parameters(params_path)
         self.output_dir = Path(root_output_dir) / subfolder_name / 'csv_data'
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.diagnostics_dir = mlp_diagnostics_dir(self.base_dir) / subfolder_name
         self.mlp_diagnostics = MlpDiagnostics()
         self.model_classes = REGRESSORS.copy()
         print(f"[{self.__class__.__name__}] Инициализирован. Папка: {self.output_dir}")
-        print(f"  Параметры моделей: {params_path if params_path.is_file() else 'BEST_PARAMS'}")
+        print(f"  Параметры моделей: {params_path if self.parameter_source == MODEL_PARAMS_FILENAME else self.parameter_source}")
 
     def model_parameters(self, model_name, target_var, dataset_name, *, mode=None):
         records = self.parameter_records[mode or self.forecast_mode]
@@ -198,12 +211,17 @@ class BaseForecaster:
                 raise ValueError(reason)
         return df
 
-    def _report_cached_metrics(self, filename, dataset_name, target_var, climatology, hashes, *, force):
+    def _report_cached_metrics(self, filename, dataset_name, target_var, climatology, hashes, evaluation_period, *, force):
         if force:
             print(f'  [RUN] {filename}: задан --force.')
             return False
+        path = self.output_dir / filename
         try:
+            initial_state = input_file_state((path,))
             cached = self._load_cached_predictions(filename, dataset_name, target_var, hashes)
+            check_forecast_metadata(path, evaluation_period)
+            if input_file_state((path,)) != initial_state:
+                raise ValueError('CSV изменился при чтении')
         except FileNotFoundError:
             print(f'  [RUN] {filename}: CSV отсутствует.')
             return False
@@ -219,7 +237,7 @@ class BaseForecaster:
             print(format_forecast_metrics(metrics, padding='      '))
         return True
 
-    def _save_predictions(self, predictions, filename, dataset_name, hashes):
+    def _save_predictions(self, predictions, filename, dataset_name, hashes, *, source, target, evaluation_period, models):
         df = pd.concat(predictions) if predictions else pd.DataFrame(columns=FORECAST_COLUMNS)
         df = df.assign(**hashes)
         df['History_Policy'] = HISTORY_POLICIES[dataset_name]
@@ -229,10 +247,10 @@ class BaseForecaster:
         if self.forecast_mode == ANNUAL_FORECAST_MODE:
             df['Forecast_Mode'] = self.forecast_mode
         mark_prediction_source(df, dataset_name)
-        with TemporaryDirectory(dir=self.output_dir) as temp_dir:
-            temp_file = Path(temp_dir) / filename
-            df.to_csv(temp_file, index=False)
-            temp_file.replace(self.output_dir / filename)
+        save_forecast_result(
+            self.output_dir / filename, df, source=source, mode=self.forecast_mode, target=target,
+            evaluation_period=evaluation_period, models=models,
+        )
 
     def _can_predict(self, df_train, df_test, model_name, target_var, dataset_name, *, mode=None):
         params = self.model_parameters(model_name, target_var, dataset_name, mode=mode)
@@ -249,16 +267,12 @@ class BaseForecaster:
         return load_forecast_data(self.base_dir, dataset_name)
 
     def _load_data_and_hashes(self, dataset_name):
-        paths = forecast_input_files(self.base_dir, dataset_name)
-        initial_state = input_file_state(paths)
+        data, source = load_forecast_input_snapshot(self.base_dir, dataset_name, self.load_data)
         hashes = {
-            'Input_Data_Hash': files_digest(paths),
+            'Input_Data_Hash': combine_file_checksums(source['files_sha256'].values()),
             'Forecast_Code_Hash': FORECAST_CODE_HASH,
         }
-        data = self.load_data(dataset_name)
-        if input_file_state(paths) != initial_state:
-            raise ValueError(f'{dataset_name}: входные файлы изменились при загрузке. Повторите запуск.')
-        return data, hashes
+        return data, hashes, source
 
     def create_features(self, df):
         return create_time_features(df)
@@ -273,9 +287,20 @@ class BaseForecaster:
         self.mlp_diagnostics.save(self.diagnostics_dir / Path(filename).with_suffix('.json'))
         self.mlp_diagnostics = MlpDiagnostics()
 
-    def _fit_predict_model(self, df_train, df_test, model_name, target_var, dataset_name, *, y_train=None):
+    def _build_model(self, model_name, target_var, dataset_name):
         params = self.model_parameters(model_name, target_var, dataset_name)
-        model = build_regressor(self.model_classes[model_name], model_name, params)
+        return build_regressor(self.model_classes[model_name], model_name, params)
+
+    def _model_metadata(self, model_name, target_var, dataset_name, training):
+        model = self._build_model(model_name, target_var, dataset_name)
+        return {
+            'parameter_source': self.parameter_source,
+            'parameters': model.get_params(deep=False),
+            'training': training,
+        }
+
+    def _fit_predict_model(self, df_train, df_test, model_name, target_var, dataset_name, *, y_train=None):
+        model = self._build_model(model_name, target_var, dataset_name)
         X_train, X_test, y_train = prepare_regression_inputs(df_train, df_test, target_var, y_train)
         self._fit_regressor(model, X_train, y_train, df_test, target_var, dataset_name)
         return restore_regression_predictions(model.predict(X_test), target_var)
@@ -295,16 +320,19 @@ class StandardForecaster(BaseForecaster):
     
     def run(self, target_year, dataset_name, *, target_month=None, force=False):
         self.mlp_diagnostics = MlpDiagnostics()
-        df_full, hashes = self._load_data_and_hashes(dataset_name)
+        df_full, hashes, source = self._load_data_and_hashes(dataset_name)
         climatology = None if df_full.empty else station_month_climatology(df_full, [target_year])
         period = str(target_year) if target_month is None else f'{target_year}-{target_month:02d}'
         forecast_dates = pd.date_range(period, periods=12 if target_month is None else 1, freq='MS')
+        evaluation_period = (forecast_dates[0].strftime('%Y-%m'), forecast_dates[-1].strftime('%Y-%m'))
         eligible_forecasts = None
 
         for target_var in ['DTR', 'Precip']:
             fname = forecast_filename(dataset_name, target_var, target_year, month=target_month)
 
-            if self._report_cached_metrics(fname, dataset_name, target_var, climatology, hashes, force=force):
+            if self._report_cached_metrics(
+                fname, dataset_name, target_var, climatology, hashes, evaluation_period, force=force,
+            ):
                 continue
 
             if df_full.empty:
@@ -316,11 +344,13 @@ class StandardForecaster(BaseForecaster):
 
             print(f"\n>>> Стандартный прогноз: {target_var} на {period} ({dataset_name}) <<<")
             all_predictions = []
+            models = {}
             train_rows = select_model_rows(history, target_var)
             
             for model_name in self.model_classes.keys():
                 print(f"  Модель: {model_name}...", end=" ", flush=True)
                 model_results = []
+                training = []
                 
                 # Walk-Forward по месяцам
                 for forecast_date, df_train, df_pred in monthly_splits(train_rows, eligible_forecasts, forecast_dates):
@@ -328,6 +358,7 @@ class StandardForecaster(BaseForecaster):
                         continue
                     
                     preds = self._fit_predict_model(df_train, df_pred, model_name, target_var, dataset_name)
+                    training.append(training_split(forecast_date, df_train['Date']))
                     
                     res = df_pred[['Date', 'WMO', 'Latitude', 'Longitude']].copy()
                     res['Forecast'] = preds
@@ -346,6 +377,7 @@ class StandardForecaster(BaseForecaster):
                 self._print_coverage(len(forecast_rows), len(eligible_forecasts), len(results), len(pairs))
                 if model_results:
                     all_predictions.append(results)
+                    models[model_name] = self._model_metadata(model_name, target_var, dataset_name, training)
                 else:
                     print("    Нет строк для прогноза.")
 
@@ -353,7 +385,10 @@ class StandardForecaster(BaseForecaster):
                 print(format_forecast_metrics(metrics, padding='    '))
             
             self._save_mlp_diagnostics(fname)
-            self._save_predictions(all_predictions, fname, dataset_name, hashes)
+            self._save_predictions(
+                all_predictions, fname, dataset_name, hashes, source=source, target=target_var,
+                evaluation_period=evaluation_period, models=models,
+            )
             print(f"  -> Сохранено: {fname}")
 
 # ============================================================================
@@ -367,7 +402,7 @@ class LongTermValidator(BaseForecaster):
 
     def run(self, split_year, dataset_name, end_year=None, *, force=False):
         self.mlp_diagnostics = MlpDiagnostics()
-        df_full, hashes = self._load_data_and_hashes(dataset_name)
+        df_full, hashes, source = self._load_data_and_hashes(dataset_name)
         if df_full.empty:
             print(f'  {dataset_name}: нет месячных рядов для валидации.')
             return
@@ -378,10 +413,13 @@ class LongTermValidator(BaseForecaster):
             return
 
         climatology = station_month_climatology(df_full, test_years)
+        evaluation_period = (f'{split_year}-01', f'{end_year}-12' if end_year is not None else None)
         features = None
         for target_var in ['DTR', 'Precip']:
             fname = validation_filename(dataset_name, target_var, split_year, final_year)
-            if self._report_cached_metrics(fname, dataset_name, target_var, climatology, hashes, force=force):
+            if self._report_cached_metrics(
+                fname, dataset_name, target_var, climatology, hashes, evaluation_period, force=force,
+            ):
                 continue
 
             if features is None:
@@ -398,21 +436,25 @@ class LongTermValidator(BaseForecaster):
             print(f"  Переменная: {target_var}...")
             targets = annual_targets(df_full, features, target_var)
             all_predictions = []
+            models = {}
 
             for model_name in self.model_classes:
                 print(f"    {model_name}:")
                 print(f"      Пар станция-год до отбора: {candidate_count}, после отбора: {eligible_count}")
                 model_results = []
+                training = []
                 splits = self.annual_model_splits(features, targets, test_years, model_name, target_var, dataset_name)
                 for df_train, df_test, y_train, facts in splits:
                     predictions = self._fit_predict_model(
                         df_train, df_test, model_name, target_var, dataset_name, y_train=y_train,
                     )
+                    training.append(training_split(df_test['Date'].iat[0], df_train['Date'], horizon_months=12))
                     model_results.append(annual_prediction_rows(df_test, predictions, facts, model_name, target_var))
 
                 results = pd.concat(model_results) if model_results else pd.DataFrame(columns=FORECAST_COLUMNS)
                 if model_results:
                     all_predictions.append(results)
+                    models[model_name] = self._model_metadata(model_name, target_var, dataset_name, training)
                 else:
                     print("      Нет строк для прогноза.")
 
@@ -422,6 +464,9 @@ class LongTermValidator(BaseForecaster):
                 print(format_forecast_metrics(metrics, padding='      '))
 
             self._save_mlp_diagnostics(fname)
-            self._save_predictions(all_predictions, fname, dataset_name, hashes)
+            self._save_predictions(
+                all_predictions, fname, dataset_name, hashes, source=source, target=target_var,
+                evaluation_period=evaluation_period, models=models,
+            )
             print(f"  -> Результаты валидации сохранены в {fname}")
         return final_year
